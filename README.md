@@ -60,6 +60,16 @@ Writes are **off by default**. Per system in `systems.json`:
 
 Delete is intentionally **not** supported.
 
+## Token economy
+
+Tool schemas are sent to the model on every turn. Set `ADT_MCP_TOOLS=core`
+to expose only the essential ~13 tools (≈40% smaller schema); default `full`
+exposes all 21. Descriptions are kept terse.
+
+```bash
+ADT_MCP_TOOLS=core python -m adt_mcp
+```
+
 ## Test
 
 ```bash

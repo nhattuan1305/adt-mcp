@@ -52,24 +52,38 @@ def resolve_and_refresh(registry: SystemRegistry, system: str) -> str:
     return refresh_cookies(sys.url, sys.username, sys.password, sys.cookie_file)
 
 
+CORE_TOOLS = {
+    "list_systems", "list_package", "search_objects", "get_source",
+    "get_source_by_uri", "get_context", "grep_package", "find_references",
+    "update_source", "update_class_include", "create_object", "activate",
+    "refresh_cookies_for",
+}
+
+
 def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
     mcp = FastMCP("adt-mcp", host="127.0.0.1")
     mcp.registry = registry  # type: ignore[attr-defined]
     mcp.adt = adt            # type: ignore[attr-defined]
 
-    @mcp.tool()
+    # Token economy: ADT_MCP_TOOLS=core loads only the essential tools so the
+    # always-on tool schema is ~40% smaller. Default "full" loads everything.
+    mode = os.environ.get("ADT_MCP_TOOLS", "full").lower()
+    enabled = CORE_TOOLS if mode == "core" else None  # None = all
+
+    def tool(name: str):
+        def deco(fn):
+            return mcp.tool()(fn) if (enabled is None or name in enabled) else fn
+        return deco
+
+    @tool("list_systems")
     def list_systems() -> str:
         """List configured SAP systems available for source retrieval."""
         return format_systems(registry.list())
 
-    @mcp.tool()
+    @tool("get_source")
     def get_source(system: str, object_type: str, name: str,
                    function_group: str | None = None) -> str:
-        """Fetch ABAP source from a configured SAP system.
-
-        object_type: CLAS | PROG | INTF | INCL | FUGR.
-        function_group is required when object_type is FUGR.
-        """
+        """Fetch ABAP source. object_type CLAS/PROG/INTF/INCL/FUGR/DDLS/DDLX/BDEF/SRVD/TABL/VIEW/STRU; FUGR needs function_group."""
         return resolve_and_get(registry, adt, system, object_type,
                                name, function_group)
 
@@ -92,7 +106,7 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
             lines.append(f"{o['type']:<10} {o['name']}{desc}\t[{o['uri']}]")
         return "\n".join(lines)
 
-    @mcp.tool()
+    @tool("list_package")
     def list_package(system: str, package: str, recursive: bool = False) -> str:
         """List objects and subpackages inside an ABAP package.
 
@@ -104,7 +118,7 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
             return err
         return _fmt_objects(adt.list_package(sys, package, recursive))
 
-    @mcp.tool()
+    @tool("search_objects")
     def search_objects(system: str, query: str, max_results: int = 20) -> str:
         """Search ABAP objects by name/wildcard (e.g. 'ZCL_ORDER*')."""
         sys, err = _resolve(system)
@@ -112,7 +126,7 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
             return err
         return _fmt_objects(adt.search_objects(sys, query, max_results))
 
-    @mcp.tool()
+    @tool("get_source_by_uri")
     def get_source_by_uri(system: str, uri: str) -> str:
         """Fetch ABAP source for an object by its ADT URI (from list/search)."""
         sys, err = _resolve(system)
@@ -120,7 +134,7 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
             return err
         return adt.get_source_by_uri(sys, uri)
 
-    @mcp.tool()
+    @tool("get_class_method_source")
     def get_class_method_source(system: str, class_name: str,
                                 method: str) -> str:
         """Fetch a single METHOD…ENDMETHOD block from a class."""
@@ -129,7 +143,7 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
             return err
         return adt.get_class_method_source(sys, class_name, method)
 
-    @mcp.tool()
+    @tool("get_class_include")
     def get_class_include(system: str, class_name: str, include: str) -> str:
         """Fetch a class include: definitions | implementations | macros | testclasses."""
         sys, err = _resolve(system)
@@ -137,7 +151,7 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
             return err
         return adt.get_class_include(sys, class_name, include)
 
-    @mcp.tool()
+    @tool("get_object_structure")
     def get_object_structure(system: str, class_name: str) -> str:
         """List the declared method names of a class (outline)."""
         sys, err = _resolve(system)
@@ -148,7 +162,7 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
             return res
         return "\n".join(res) if res else "(no methods declared)"
 
-    @mcp.tool()
+    @tool("get_package_source")
     def get_package_source(system: str, package: str,
                            max_objects: int = 50) -> str:
         """Concatenated source of all source-bearing objects in a package."""
@@ -157,7 +171,7 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
             return err
         return adt.get_package_source(sys, package, max_objects)
 
-    @mcp.tool()
+    @tool("grep_package")
     def grep_package(system: str, package: str, pattern: str,
                      ignore_case: bool = False, max_objects: int = 100) -> str:
         """Regex-search the source of objects in a package.
@@ -169,16 +183,11 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
             return err
         return adt.grep_package(sys, package, pattern, ignore_case, max_objects)
 
-    @mcp.tool()
+    @tool("get_revisions")
     def get_revisions(system: str, object_type: str, name: str,
                       function_group: str | None = None,
                       include: str | None = None) -> str:
-        """List version history of an object (PROG/CLAS/INTF/FUNC/INCL/DDLS/BDEF/SRVD).
-
-        Returns one version per line: date  author  version  [transport]  uri.
-        For CLAS pass include (main/definitions/implementations/...) if needed;
-        for FUNC pass function_group.
-        """
+        """Version history (PROG/CLAS/INTF/FUNC/INCL/DDLS/BDEF/SRVD). CLAS: pass include; FUNC: pass function_group."""
         sys, err = _resolve(system)
         if err:
             return err
@@ -194,7 +203,7 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
                          f"{tr}\t[{r['uri']}]")
         return "\n".join(lines)
 
-    @mcp.tool()
+    @tool("get_revision_source")
     def get_revision_source(system: str, version_uri: str) -> str:
         """Fetch source of a specific past version (uri from get_revisions)."""
         sys, err = _resolve(system)
@@ -202,7 +211,7 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
             return err
         return adt.get_revision_source(sys, version_uri)
 
-    @mcp.tool()
+    @tool("compare_source")
     def compare_source(system: str, object_type: str, name: str,
                        version_uri: str, against: str = "current",
                        function_group: str | None = None) -> str:
@@ -213,15 +222,10 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
         return adt.compare_source(sys, object_type, name, version_uri,
                                   against, function_group)
 
-    @mcp.tool()
+    @tool("find_references")
     def find_references(system: str, object_uri: str, line: int = 0,
                         column: int = 0) -> str:
-        """Where-used: find objects that use the given object (or symbol).
-
-        object_uri comes from list_package/search_objects. Optionally pass
-        line+column to find references to a specific symbol at that position.
-        Returns one user per line: TYPE NAME (package) [uri].
-        """
+        """Where-used for object_uri (from list/search). Optional line+column for a symbol at that position."""
         sys, err = _resolve(system)
         if err:
             return err
@@ -236,13 +240,9 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
             lines.append(f"{r['type']:<10} {r['name']}{pkg}\t[{r['uri']}]")
         return "\n".join(lines)
 
-    @mcp.tool()
+    @tool("cds_dependencies")
     def cds_dependencies(system: str, ddls_name: str) -> str:
-        """Upstream dependencies of a CDS view (FROM / JOIN / ASSOCIATION / COMPOSITION).
-
-        Parsed from the CDS source, so it works on cloud. For downstream impact
-        (who uses this view) use find_references on the view's URI.
-        """
+        """Upstream deps of a CDS view (FROM/JOIN/ASSOCIATION/COMPOSITION), parsed from source. Downstream: use find_references."""
         sys, err = _resolve(system)
         if err:
             return err
@@ -253,52 +253,39 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
             return "(no dependencies found)"
         return "\n".join(f"{r['relation']:<12} {r['name']}" for r in res)
 
-    @mcp.tool()
+    @tool("get_context")
     def get_context(system: str, object_type: str, name: str,
                     depth: int = 1) -> str:
-        """Bundle an object's full source + its compressed dependencies.
-
-        For CDS (DDLS) it recurses through FROM/ASSOCIATION/COMPOSITION up to
-        `depth`, expanding custom (Z*) views/tables (compressed) and listing
-        standard SAP objects. One call instead of many get_source calls.
-        """
+        """Object full source + compressed CDS deps recursed to depth (custom expanded, standard listed). One call vs many."""
         sys, err = _resolve(system)
         if err:
             return err
         return adt.get_context(sys, object_type, name, depth)
 
-    @mcp.tool()
+    @tool("update_source")
     def update_source(system: str, object_type: str, name: str, source: str,
                       transport: str | None = None,
                       function_group: str | None = None,
                       activate: bool = True) -> str:
-        """Edit an existing object's source, then activate (write — requires allow_write).
-
-        object_type: CLAS/PROG/INTF/INCL/DDLS/DDLX/BDEF/SRVD/TABL/VIEW/STRU/FUGR.
-        Pass activate=False to defer activation when writing several parts.
-        """
+        """Edit + activate an object (write; needs allow_write). Types CLAS/PROG/INTF/INCL/DDLS/DDLX/BDEF/SRVD/TABL/VIEW/STRU/FUGR. activate=False to defer."""
         sys, err = _resolve(system)
         if err:
             return err
         return adt.update_source(sys, object_type, name, source, transport,
                                  function_group, activate)
 
-    @mcp.tool()
+    @tool("update_class_include")
     def update_class_include(system: str, class_name: str, include: str,
                              source: str, transport: str | None = None,
                              activate: bool = True) -> str:
-        """Edit a class include: main / definitions / implementations / macros / testclasses.
-
-        RAP behavior logic lives in 'implementations' (local lhc_*/lsc_* classes).
-        Use activate=False to write several includes, then call activate once.
-        """
+        """Edit a class include: main/definitions/implementations/macros/testclasses (RAP logic in implementations). activate=False to batch."""
         sys, err = _resolve(system)
         if err:
             return err
         return adt.update_class_include(sys, class_name, include, source,
                                         transport, activate)
 
-    @mcp.tool()
+    @tool("activate")
     def activate(system: str, object_type: str, name: str,
                  function_group: str | None = None) -> str:
         """Activate an object (write — requires allow_write)."""
@@ -307,19 +294,13 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
             return err
         return adt.activate(sys, object_type, name, function_group)
 
-    @mcp.tool()
+    @tool("create_object")
     def create_object(system: str, object_type: str, name: str, package: str,
                       description: str = "", source: str | None = None,
                       transport: str | None = None,
                       service_definition: str | None = None,
                       binding_version: str = "V2") -> str:
-        """Create a new RAP object (write — requires allow_write).
-
-        Types: CLAS/PROG/INTF/DDLS/DDLX/BDEF/SRVD/SRVB/TABL. package must exist;
-        transport required for transportable packages (omit for local $). If
-        source is given (source types), it is written and activated. SRVB needs
-        service_definition.
-        """
+        """Create RAP object (write; needs allow_write). Types CLAS/PROG/INTF/DDLS/DDLX/BDEF/SRVD/SRVB/TABL. package must exist; transport for transportable pkgs; source (if given) is written+activated; SRVB needs service_definition."""
         sys, err = _resolve(system)
         if err:
             return err
@@ -327,14 +308,9 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
                                  source, transport, service_definition,
                                  binding_version)
 
-    @mcp.tool()
+    @tool("refresh_cookies_for")
     def refresh_cookies_for(system: str) -> str:
-        """Refresh expired SAML session cookies for a cookie_file system.
-
-        Performs a headless browser login using the system's stored
-        username/password and rewrites its cookie file. Use when get_source
-        reports the session expired.
-        """
+        """Refresh expired session cookies (headless login with stored creds). Use when calls report session expired."""
         return resolve_and_refresh(registry, system)
 
     web_dir = os.path.join(
