@@ -382,6 +382,78 @@ def test_parse_cds_dependencies_join():
     assert ("FROM", "a") in rels and ("JOIN", "b") in rels
 
 
+# --- syntax check (ABAP check run) ---
+from adt_mcp.adt_client import parse_check_run
+
+
+def test_parse_check_run():
+    data = (b'<?xml version="1.0"?>'
+            b'<chkrun:checkRunReports '
+            b'xmlns:chkrun="http://www.sap.com/adt/checkrun">'
+            b'<chkrun:checkReport chkrun:reporter="abapCheckRun">'
+            b'<chkrun:checkMessageList>'
+            b'<chkrun:checkMessage chkrun:type="E" '
+            b'chkrun:shortText="Field FOO is unknown" '
+            b'chkrun:uri="/sap/bc/adt/oo/classes/ZCL/source/main#start=12,3"/>'
+            b'<chkrun:checkMessage chkrun:type="W" '
+            b'chkrun:shortText="Variable BAR not used" '
+            b'chkrun:uri="/x#start=20,1"/>'
+            b'</chkrun:checkMessageList>'
+            b'</chkrun:checkReport>'
+            b'</chkrun:checkRunReports>')
+    msgs = parse_check_run(data)
+    assert len(msgs) == 2
+    assert msgs[0]["type"] == "E"
+    assert msgs[0]["line"] == "12"
+    assert msgs[0]["text"] == "Field FOO is unknown"
+    assert msgs[1]["type"] == "W"
+
+
+def test_parse_check_run_empty():
+    assert parse_check_run(b"") == []
+
+
+# --- API release state ---
+from adt_mcp.adt_client import parse_release_state
+
+
+def test_parse_release_state_released():
+    xml = (b'<?xml version="1.0"?><apiRelease>'
+           b'<releasableObject uri="/sap/bc/adt/oo/classes/cl_x" '
+           b'type="CLAS" name="CL_X"/>'
+           b'<c1Release contract="C1" useInKeyUserApps="false" '
+           b'useInSAPCloudPlatform="true" name="CL_X">'
+           b'<status state="RELEASED" stateDescription="Released"/>'
+           b'</c1Release>'
+           b'<apiCatalogData isAnyAssignmentPossible="true" '
+           b'isAnyContractReleased="true"/></apiRelease>')
+    st = parse_release_state(xml)
+    assert st["object"]["name"] == "CL_X"
+    assert st["anyContractReleased"] is True
+    c1 = st["contracts"][0]
+    assert c1["contract"] == "C1"
+    assert c1["state"] == "RELEASED"
+    assert c1["cloud"] is True
+    assert c1["keyUser"] is False
+
+
+def test_parse_release_state_deprecated_with_successor():
+    xml = (b'<apiRelease>'
+           b'<releasableObject type="CLAS" name="CL_OLD"/>'
+           b'<c1Release contract="C1" useInSAPCloudPlatform="true">'
+           b'<status state="DEPRECATED" stateDescription="Deprecated"/>'
+           b'<successors><successor name="CL_NEW"/></successors>'
+           b'</c1Release></apiRelease>')
+    st = parse_release_state(xml)
+    c1 = st["contracts"][0]
+    assert c1["state"] == "DEPRECATED"
+    assert c1["successors"] == ["CL_NEW"]
+
+
+def test_parse_release_state_empty():
+    assert parse_release_state(b"")["contracts"] == []
+
+
 # --- v2 Phase 6: context compression ---
 from adt_mcp.adt_client import compress_source
 

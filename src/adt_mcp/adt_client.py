@@ -1,4 +1,6 @@
 """HTTP client to fetch ABAP source from SAP ADT."""
+import base64
+import html
 import re
 import fnmatch
 import difflib
@@ -105,6 +107,83 @@ def parse_activation(data: bytes) -> str:
             if sev and sev[0] in ("E", "A", "X"):
                 errors.append(text.strip() or sev)
     return "Error: activation failed: " + "; ".join(errors) if errors else "OK"
+
+
+def parse_check_run(data: bytes) -> list[dict]:
+    """Parse a checkruns response into message dicts.
+
+    Each message: {type (E/W/I/...), text, uri, line}. type is the severity
+    letter ADT returns (E=error, W=warning, I=info, S=success).
+    """
+    if not data:
+        return []
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return []
+    out = []
+    for el in root.iter():
+        if _localname(el.tag) != "checkMessage":
+            continue
+        a = {_localname(k): v for k, v in el.attrib.items()}
+        uri = a.get("uri", "")
+        line = ""
+        m = re.search(r"start=(\d+)", uri)
+        if m:
+            line = m.group(1)
+        out.append({
+            "type": (a.get("type") or "").upper(),
+            "text": a.get("shortText") or (el.text or "").strip(),
+            "uri": uri,
+            "line": line,
+        })
+    return out
+
+
+def parse_release_state(data: bytes) -> dict:
+    """Parse an apireleases response into a release-state dict.
+
+    Returns {object: {name,type}, contracts: [{contract, state,
+    stateDescription, cloud, keyUser, successors:[name]}],
+    anyContractReleased: bool}.
+    """
+    text = (data or b"").decode("utf-8", "replace").strip()
+    # The endpoint sometimes returns the XML JSON-quoted / HTML-escaped.
+    if text[:1] == '"' and text[-1:] == '"':
+        text = text[1:-1].encode().decode("unicode_escape")
+    if "&lt;" in text:
+        text = html.unescape(text)
+    out: dict = {"object": {}, "contracts": [], "anyContractReleased": False}
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return out
+    for el in root.iter():
+        ln = _localname(el.tag)
+        a = {_localname(k): v for k, v in el.attrib.items()}
+        if ln == "releasableObject":
+            out["object"] = {"name": a.get("name", ""),
+                             "type": a.get("type", ""),
+                             "uri": a.get("uri", "")}
+        elif ln.endswith("Release") and ln != "apiRelease":
+            c = {"contract": a.get("contract", "") or ln.replace("Release", ""),
+                 "state": "", "stateDescription": "",
+                 "cloud": a.get("useInSAPCloudPlatform", "") == "true",
+                 "keyUser": a.get("useInKeyUserApps", "") == "true",
+                 "successors": []}
+            for ch in el.iter():
+                cln = _localname(ch.tag)
+                ca = {_localname(k): v for k, v in ch.attrib.items()}
+                if cln == "status":
+                    c["state"] = ca.get("state", "")
+                    c["stateDescription"] = ca.get("stateDescription", "")
+                elif cln == "successor" and ca.get("name"):
+                    c["successors"].append(ca["name"])
+            out["contracts"].append(c)
+        elif ln == "apiCatalogData":
+            out["anyContractReleased"] = \
+                a.get("isAnyContractReleased", "") == "true"
+    return out
 
 
 def parse_netscape_cookies(text: str) -> dict[str, str]:
@@ -772,6 +851,149 @@ class ADTClient:
         if source.startswith("Error:"):
             return source
         return parse_cds_dependencies(source)
+
+    # --- Syntax check (ABAP check run) ---
+
+    def syntax_check(self, system: System, object_type: str, name: str,
+                     function_group: str | None = None,
+                     version: str = "active",
+                     source: str | None = None) -> str:
+        """Run the ABAP syntax/check-run for an object; return findings text.
+
+        The source to check is embedded as a base64 artifact (the check-run
+        reporter checks the supplied content, not the stored version — without
+        an artifact the server returns no messages, a false OK). If `source`
+        is omitted, the current active source is fetched and checked.
+
+        version: kept for the checkObject element ('active'/'inactive').
+        Returns 'OK: no syntax errors' when clean.
+        """
+        try:
+            root_path = object_root_path(object_type, name, function_group)
+        except ValueError as e:
+            return f"Error: {e}"
+        if source is None:
+            source = self.get_source(system, object_type, name, function_group)
+            if source.startswith("Error:"):
+                return source
+        artifact_uri = f"{root_path}/source/main"
+        encoded = base64.b64encode(source.encode("utf-8")).decode("ascii")
+        body = (
+            f'<?xml version="1.0" encoding="UTF-8"?>'
+            f'<chkrun:checkObjectList '
+            f'xmlns:chkrun="http://www.sap.com/adt/checkrun" '
+            f'xmlns:adtcore="http://www.sap.com/adt/core">'
+            f'<chkrun:checkObject adtcore:uri="{root_path}" '
+            f'chkrun:version="{version}">'
+            f'<chkrun:artifacts>'
+            f'<chkrun:artifact '
+            f'chkrun:contentType="text/plain; charset=utf-8" '
+            f'chkrun:uri="{artifact_uri}">'
+            f'<chkrun:content>{encoded}</chkrun:content>'
+            f'</chkrun:artifact>'
+            f'</chkrun:artifacts>'
+            f'</chkrun:checkObject>'
+            f'</chkrun:checkObjectList>').encode("utf-8")
+        url = (f"{base_url(system.url)}/sap/bc/adt/checkruns"
+               f"?reporters=abapCheckRun")
+        try:
+            resp = self._post(
+                system, url, "application/*", body, "application/*")
+        except httpx.HTTPError as e:
+            return f"Error: check request failed: {e}"
+        if resp.status_code != 200:
+            return (f"Error: syntax check failed (HTTP {resp.status_code}): "
+                    f"{resp.text[:300]}")
+        if is_login_page(resp):
+            return (f"Error: session expired for system {system.name!r} "
+                    f"— refresh cookies and retry")
+        msgs = parse_check_run(resp.content)
+        errors = [m for m in msgs if m["type"][:1] in ("E", "A", "X")]
+        warnings = [m for m in msgs if m["type"][:1] == "W"]
+        if not errors and not warnings:
+            return f"OK: no syntax errors ({object_type.upper()} {name.upper()})"
+
+        def fmt(m: dict) -> str:
+            loc = f":{m['line']}" if m["line"] else ""
+            return f"{m['type']}{loc}: {m['text']}"
+
+        lines = [f"{len(errors)} error(s), {len(warnings)} warning(s) "
+                 f"in {object_type.upper()} {name.upper()}:"]
+        lines += [fmt(m) for m in errors + warnings]
+        return "\n".join(lines)
+
+    # --- Pretty printer (ABAP source formatter) ---
+
+    def pretty_print(self, system: System, source: str) -> str:
+        """Format ABAP source via the ADT pretty printer (user's settings)."""
+        if not source:
+            return "Error: empty source"
+        url = (f"{base_url(system.url)}/sap/bc/adt/abapsource/prettyprinter"
+               f"?sap-client={system.client}")
+        try:
+            resp = self._post(system, url, "text/plain",
+                              source.encode("utf-8"), "text/plain")
+        except httpx.HTTPError as e:
+            return f"Error: pretty print request failed: {e}"
+        if resp.status_code != 200:
+            return (f"Error: pretty print failed (HTTP {resp.status_code}): "
+                    f"{resp.text[:300]}")
+        if is_login_page(resp):
+            return (f"Error: session expired for system {system.name!r} "
+                    f"— refresh cookies and retry")
+        # Empty body => server returned nothing to change; keep the original.
+        return resp.text if resp.text else source
+
+    # --- API release state (ABAP Cloud / Clean Core) ---
+
+    def api_release_state(self, system: System, object_type: str, name: str,
+                          function_group: str | None = None) -> str:
+        """Report the API release state of an object (released for ABAP Cloud?)."""
+        try:
+            root_path = object_root_path(object_type, name, function_group)
+        except ValueError as e:
+            return f"Error: {e}"
+        endpoint = (f"{base_url(system.url)}/sap/bc/adt/apireleases/"
+                    f"{quote(root_path, safe='')}"
+                    f"?sap-client={system.client}")
+        try:
+            resp = self._get(
+                system, endpoint,
+                "application/vnd.sap.adt.apirelease.v10+xml")
+        except httpx.HTTPError as e:
+            return f"Error: request failed: {e}"
+        if resp.status_code == 404:
+            return (f"Error: no release info ({object_type.upper()} "
+                    f"{name.upper()}) — object unknown or not releasable")
+        if resp.status_code != 200:
+            return f"Error: HTTP {resp.status_code}: {resp.text[:200]}"
+        if is_login_page(resp):
+            return (f"Error: session expired for system {system.name!r} "
+                    f"— refresh cookies and retry")
+        st = parse_release_state(resp.content)
+        obj = st["object"] or {"name": name.upper(), "type": object_type.upper()}
+        # Drop empty contract-slot placeholders (no state/flags/successors).
+        contracts = [c for c in st["contracts"]
+                     if c["state"] or c["cloud"] or c["keyUser"]
+                     or c["successors"]]
+        cloud_ok = any(c["cloud"] and c["state"] == "RELEASED"
+                       for c in contracts)
+        head = (f"{obj.get('name', name.upper())} "
+                f"({obj.get('type', object_type.upper())}) - "
+                + ("RELEASED for ABAP Cloud" if cloud_ok
+                   else "NOT released for ABAP Cloud"))
+        lines = [head]
+        if not contracts:
+            lines.append("  (no release contracts)")
+        for c in contracts:
+            succ = (f"  successors: {', '.join(c['successors'])}"
+                    if c["successors"] else "")
+            lines.append(
+                f"  {c['contract']}: {c['state'] or '?'}"
+                f" ({c['stateDescription'] or '-'})"
+                f"  cloud={'yes' if c['cloud'] else 'no'}"
+                f" keyUser={'yes' if c['keyUser'] else 'no'}{succ}")
+        return "\n".join(lines)
 
     # --- Context compression (v2 Phase 6) ---
 

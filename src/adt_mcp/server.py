@@ -56,7 +56,7 @@ CORE_TOOLS = {
     "list_systems", "list_package", "search_objects", "get_source",
     "get_source_by_uri", "get_context", "grep_package", "find_references",
     "update_source", "update_class_include", "create_object", "activate",
-    "refresh_cookies_for",
+    "syntax_check", "refresh_cookies_for",
 }
 
 
@@ -252,6 +252,35 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
         if not res:
             return "(no dependencies found)"
         return "\n".join(f"{r['relation']:<12} {r['name']}" for r in res)
+
+    @tool("syntax_check")
+    def syntax_check(system: str, object_type: str, name: str,
+                     function_group: str | None = None,
+                     version: str = "active",
+                     source: str | None = None) -> str:
+        """ABAP syntax/check-run on an object; reports errors+warnings. Checks `source` if given, else current active source. FUGR needs function_group."""
+        sys, err = _resolve(system)
+        if err:
+            return err
+        return adt.syntax_check(sys, object_type, name, function_group,
+                                version, source)
+
+    @tool("pretty_print")
+    def pretty_print(system: str, source: str) -> str:
+        """Format ABAP source via ADT pretty printer (applies the system's keyword-case/indent settings). Returns formatted code."""
+        sys, err = _resolve(system)
+        if err:
+            return err
+        return adt.pretty_print(sys, source)
+
+    @tool("api_release_state")
+    def api_release_state(system: str, object_type: str, name: str,
+                          function_group: str | None = None) -> str:
+        """Check if an object is released for ABAP Cloud (Clean Core C0–C4 contracts). Types CLAS/INTF/DDLS/TABL/... ; FUGR needs function_group."""
+        sys, err = _resolve(system)
+        if err:
+            return err
+        return adt.api_release_state(sys, object_type, name, function_group)
 
     @tool("get_context")
     def get_context(system: str, object_type: str, name: str,
