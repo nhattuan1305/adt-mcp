@@ -143,3 +143,128 @@ def test_create_object_ok_no_source():
         return httpx.Response(201, text="")
     out = _client(handler).create_object(_sys(), "DDLS", "ZR", "ZPKG", "desc")
     assert out.startswith("OK: created DDLS ZR")
+
+
+# --- CSRF token caching + refetch (fix 1) ---
+def test_csrf_token_cached_across_posts():
+    gets = {"n": 0}
+
+    def handler(req):
+        if req.method == "GET" and "discovery" in str(req.url):
+            gets["n"] += 1
+            return httpx.Response(200, headers={"x-csrf-token": "T"})
+        return httpx.Response(200, content=b"<messages/>")
+
+    c = _client(handler)
+    c.activate(_sys(), "CLAS", "ZCL_A")
+    c.activate(_sys(), "CLAS", "ZCL_B")
+    assert gets["n"] == 1  # token fetched once, reused for the 2nd activate
+
+
+def test_post_refetches_csrf_on_403_required():
+    state = {"tokens": ["T1", "T2"], "i": 0, "posts": []}
+
+    def handler(req):
+        u = str(req.url)
+        if req.method == "GET" and "discovery" in u:
+            t = state["tokens"][min(state["i"], len(state["tokens"]) - 1)]
+            state["i"] += 1
+            return httpx.Response(200, headers={"x-csrf-token": t})
+        if req.method == "POST" and "activation" in u:
+            state["posts"].append(req.headers.get("x-csrf-token"))
+            if req.headers.get("x-csrf-token") == "T1":
+                return httpx.Response(403, headers={"x-csrf-token": "Required"},
+                                      text="CSRF token validation failed")
+            return httpx.Response(200, content=b"<messages/>")
+        return httpx.Response(404)
+
+    out = _client(handler).activate(_sys(), "CLAS", "ZCL_A")
+    assert out == "OK"
+    assert state["posts"] == ["T1", "T2"]  # rejected → refetched & retried
+
+
+# --- write respects session-cookie rotation (fix 2) ---
+def test_write_uses_jar_and_respects_cookie_rotation():
+    seen = {}
+
+    def handler(req):
+        u = str(req.url)
+        if "discovery" in u:
+            return httpx.Response(200, headers={"x-csrf-token": "T"})
+        if req.method == "GET":  # object_package
+            return httpx.Response(
+                200, headers={"content-type": "application/xml"},
+                content=b'<r><adtcore:packageRef xmlns:adtcore="x" '
+                        b'adtcore:name="ZPKG"/></r>')
+        if "_action=LOCK" in u:
+            # server rotates the session cookie on lock
+            return httpx.Response(
+                200, content=b'<a><DATA><LOCK_HANDLE>LH</LOCK_HANDLE></DATA></a>',
+                headers={"content-type": "application/xml",
+                         "set-cookie": "SAP_SESSIONID=ROTATED; Path=/"})
+        if req.method == "PUT":
+            seen["put_cookie"] = req.headers.get("cookie")
+            return httpx.Response(200, text="")
+        if "_action=UNLOCK" in u:
+            return httpx.Response(200, text="")
+        if "activation" in u:
+            return httpx.Response(200, content=b"<messages/>")
+        return httpx.Response(404)
+
+    s = _sys(auth="cookie", username=None, password=None,
+             cookie_string="SAP_SESSIONID=ORIG")
+    out = _client(handler).update_source(s, "CLAS", "ZCL_A", "x")
+    assert out == "OK"
+    assert "ROTATED" in seen["put_cookie"]   # PUT carries the rotated session
+    assert "ORIG" not in seen["put_cookie"]  # not the stale original
+
+
+# --- stuck-lock / session-expired surfaced (fix 3) ---
+def test_update_source_stuck_lock_surfaced():
+    def handler(req):
+        u = str(req.url)
+        if "discovery" in u:
+            return httpx.Response(200, headers={"x-csrf-token": "T"})
+        if req.method == "GET":
+            return httpx.Response(
+                200, headers={"content-type": "application/xml"},
+                content=b'<r><adtcore:packageRef xmlns:adtcore="x" '
+                        b'adtcore:name="ZPKG"/></r>')
+        if "_action=LOCK" in u:
+            return httpx.Response(
+                200, content=b'<a><DATA><LOCK_HANDLE>LH</LOCK_HANDLE></DATA></a>',
+                headers={"content-type": "application/xml"})
+        if req.method == "PUT":
+            return httpx.Response(403, text="session expired")
+        if "_action=UNLOCK" in u:
+            return httpx.Response(403, text="session expired")  # unlock fails too
+        return httpx.Response(404)
+
+    out = _client(handler).update_source(_sys(), "CLAS", "ZCL_A", "x")
+    assert "may remain locked" in out.lower()
+    assert "refresh" in out.lower()
+
+
+def test_update_source_put_fail_but_unlock_ok_no_stuck_message():
+    def handler(req):
+        u = str(req.url)
+        if "discovery" in u:
+            return httpx.Response(200, headers={"x-csrf-token": "T"})
+        if req.method == "GET":
+            return httpx.Response(
+                200, headers={"content-type": "application/xml"},
+                content=b'<r><adtcore:packageRef xmlns:adtcore="x" '
+                        b'adtcore:name="ZPKG"/></r>')
+        if "_action=LOCK" in u:
+            return httpx.Response(
+                200, content=b'<a><DATA><LOCK_HANDLE>LH</LOCK_HANDLE></DATA></a>',
+                headers={"content-type": "application/xml"})
+        if req.method == "PUT":
+            return httpx.Response(400, text="syntax error in source")
+        if "_action=UNLOCK" in u:
+            return httpx.Response(200, text="")  # unlock succeeds → not stuck
+        return httpx.Response(404)
+
+    out = _client(handler).update_source(_sys(), "CLAS", "ZCL_A", "x")
+    assert "may remain locked" not in out.lower()
+    assert "syntax error" in out.lower()

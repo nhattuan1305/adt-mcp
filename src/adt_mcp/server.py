@@ -56,7 +56,7 @@ CORE_TOOLS = {
     "list_systems", "list_package", "search_objects", "get_source",
     "get_source_by_uri", "get_context", "grep_package", "find_references",
     "update_source", "update_class_include", "create_object", "activate",
-    "syntax_check", "refresh_cookies_for",
+    "syntax_check", "run_unit_tests", "data_preview", "refresh_cookies_for",
 }
 
 
@@ -265,6 +265,50 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
         return adt.syntax_check(sys, object_type, name, function_group,
                                 version, source)
 
+    @tool("run_unit_tests")
+    def run_unit_tests(system: str, object_type: str, name: str) -> str:
+        """Run ABAP Unit for an object; reports pass/fail per method + assertion alerts. Types CLAS/PROG/FUGR (FUGR = whole group)."""
+        sys, err = _resolve(system)
+        if err:
+            return err
+        return adt.run_unit_tests(sys, object_type, name)
+
+    @tool("data_preview")
+    def data_preview(system: str, query: str, max_rows: int = 100) -> str:
+        """Preview data of a CDS entity or Open SQL SELECT. query = entity name (→ SELECT * FROM it) or a full SELECT. Returns a column/row table."""
+        sys, err = _resolve(system)
+        if err:
+            return err
+        return adt.data_preview(sys, query, max_rows)
+
+    @tool("trace_start")
+    def trace_start(system: str, process_type: str = "http",
+                    max_executions: int = 3, expires_minutes: int = 60,
+                    title: str = "ai-trace") -> str:
+        """Arm an ABAP profiler trace for your next runs, then run the slow workload. process_type: http (Fiori/OData/data_preview) | dialog | batch. Then call trace_list + trace_analyze."""
+        sys, err = _resolve(system)
+        if err:
+            return err
+        return adt.trace_start(sys, process_type=process_type,
+                               max_executions=max_executions,
+                               expires_minutes=expires_minutes, title=title)
+
+    @tool("trace_list")
+    def trace_list(system: str, max_runs: int = 20) -> str:
+        """List your recorded ABAP profiler runs (newest first) with total/ABAP/DB time — pick a uri for trace_analyze."""
+        sys, err = _resolve(system)
+        if err:
+            return err
+        return adt.trace_list(sys, max_runs)
+
+    @tool("trace_analyze")
+    def trace_analyze(system: str, trace_uri: str, top: int = 15) -> str:
+        """Digest one trace (uri from trace_list): top time consumers + DB accesses (table/stmt/count/buffered/db_ms) — shows why it's slow."""
+        sys, err = _resolve(system)
+        if err:
+            return err
+        return adt.trace_analyze(sys, trace_uri, top)
+
     @tool("pretty_print")
     def pretty_print(system: str, source: str) -> str:
         """Format ABAP source via ADT pretty printer (applies the system's keyword-case/indent settings). Returns formatted code."""
@@ -285,7 +329,7 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
     @tool("get_context")
     def get_context(system: str, object_type: str, name: str,
                     depth: int = 1) -> str:
-        """Object full source + compressed CDS deps recursed to depth (custom expanded, standard listed). One call vs many."""
+        """Object full source + compressed deps. DDLS: CDS deps recursed to depth. BDEF: behavior-for CDS + impl class. CLAS: superclass + interfaces. Custom expanded, standard listed."""
         sys, err = _resolve(system)
         if err:
             return err

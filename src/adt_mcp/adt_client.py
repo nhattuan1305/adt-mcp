@@ -6,6 +6,7 @@ import fnmatch
 import difflib
 import xml.etree.ElementTree as ET
 import httpx
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit, quote
 from .registry import System
 
@@ -137,6 +138,224 @@ def parse_check_run(data: bytes) -> list[dict]:
             "uri": uri,
             "line": line,
         })
+    return out
+
+
+def parse_aunit_result(data: bytes) -> list[dict]:
+    """Parse an ABAP Unit runResult into per-method dicts.
+
+    Each: {class, method, time, alerts:[{severity, kind, title, details:[..]}]}.
+    A method with no alerts passed; alerts of severity critical/fatal are
+    failures (warnings keep a lower severity).
+    """
+    if not data:
+        return []
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return []
+    out = []
+    for tclass in root.iter():
+        if _localname(tclass.tag) != "testClass":
+            continue
+        ca = {_localname(k): v for k, v in tclass.attrib.items()}
+        cname = ca.get("name", "")
+        for tm in tclass.iter():
+            if _localname(tm.tag) != "testMethod":
+                continue
+            ma = {_localname(k): v for k, v in tm.attrib.items()}
+            alerts = []
+            for al in tm.iter():
+                if _localname(al.tag) != "alert":
+                    continue
+                aa = {_localname(k): v for k, v in al.attrib.items()}
+                title, details = "", []
+                for sub in al.iter():
+                    sln = _localname(sub.tag)
+                    if sln == "title":
+                        title = (sub.text or "").strip()
+                    elif sln == "detail":
+                        da = {_localname(k): v for k, v in sub.attrib.items()}
+                        d = da.get("text") or (sub.text or "")
+                        if d.strip():
+                            details.append(d.strip())
+                alerts.append({"severity": aa.get("severity", ""),
+                               "kind": aa.get("kind", ""),
+                               "title": title, "details": details})
+            out.append({"class": cname, "method": ma.get("name", ""),
+                        "time": ma.get("executionTime", ""), "alerts": alerts})
+    return out
+
+
+def parse_data_preview(data: bytes) -> dict:
+    """Parse a datapreview tableData response (column-oriented) into rows.
+
+    Returns {columns:[name..], rows:[[val..]..], total:int}. The payload lists
+    one <columns> block per column (metadata + a dataSet of values); rows are
+    rebuilt by zipping the columns position-wise.
+    """
+    out = {"columns": [], "rows": [], "total": 0}
+    if not data:
+        return out
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return out
+    col_values: list[list[str]] = []
+    for el in root.iter():
+        ln = _localname(el.tag)
+        if ln == "totalRows":
+            try:
+                out["total"] = int((el.text or "0").strip())
+            except ValueError:
+                out["total"] = 0
+        elif ln == "columns":
+            name, values = "", []
+            for sub in el.iter():
+                sln = _localname(sub.tag)
+                if sln == "metadata":
+                    a = {_localname(k): v for k, v in sub.attrib.items()}
+                    name = a.get("name", "")
+                elif sln == "data":
+                    values.append(sub.text or "")
+            out["columns"].append(name)
+            col_values.append(values)
+    nrows = max((len(v) for v in col_values), default=0)
+    out["rows"] = [[col_values[c][i] if i < len(col_values[c]) else ""
+                    for c in range(len(col_values))] for i in range(nrows)]
+    return out
+
+
+def parse_trace_runs(data: bytes) -> list[dict]:
+    """Parse the ABAP profiler results feed into run dicts.
+
+    Each: {uri, title, date, runtime, runtime_abap, runtime_db, state}.
+    Times are microseconds as reported by the trace.
+    """
+    if not data:
+        return []
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return []
+    def _int(s):
+        try:
+            return int((s or "").strip())
+        except ValueError:
+            return 0
+    out = []
+    for e in root.iter():
+        if _localname(e.tag) != "entry":
+            continue
+        run = {"uri": "", "title": "", "date": "", "runtime": 0,
+               "runtime_abap": 0, "runtime_db": 0, "state": ""}
+        for c in e.iter():
+            ln = _localname(c.tag)
+            if ln == "id":
+                run["uri"] = (c.text or "").strip()
+            elif ln == "title" and not run["title"]:
+                run["title"] = (c.text or "").strip()
+            elif ln == "published":
+                run["date"] = (c.text or "").strip()
+            elif ln == "runtime":
+                run["runtime"] = _int(c.text)
+            elif ln == "runtimeABAP":
+                run["runtime_abap"] = _int(c.text)
+            elif ln == "runtimeDatabase":
+                run["runtime_db"] = _int(c.text)
+            elif ln == "state":
+                a = {_localname(k): v for k, v in c.attrib.items()}
+                run["state"] = a.get("text", "") or a.get("value", "")
+        if run["uri"]:
+            out.append(run)
+    return out
+
+
+def parse_trace_hitlist(data: bytes) -> list[dict]:
+    """Parse a trace hitlist into entries.
+
+    Each: {description, gross_time, gross_pct, net_time, net_pct, program}.
+    """
+    if not data:
+        return []
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return []
+    def _i(s):
+        try:
+            return int((s or "0").strip())
+        except ValueError:
+            return 0
+    def _f(s):
+        try:
+            return float((s or "0").strip())
+        except ValueError:
+            return 0.0
+    out = []
+    for e in root.iter():
+        if _localname(e.tag) != "entry":
+            continue
+        a = {_localname(k): v for k, v in e.attrib.items()}
+        row = {"description": a.get("description", ""), "gross_time": 0,
+               "gross_pct": 0.0, "net_time": 0, "net_pct": 0.0, "program": ""}
+        for c in e:
+            cln = _localname(c.tag)
+            ca = {_localname(k): v for k, v in c.attrib.items()}
+            if cln == "grossTime":
+                row["gross_time"] = _i(ca.get("time"))
+                row["gross_pct"] = _f(ca.get("percentage"))
+            elif cln == "traceEventNetTime":
+                row["net_time"] = _i(ca.get("time"))
+                row["net_pct"] = _f(ca.get("percentage"))
+            elif cln == "callingProgram" and not row["program"]:
+                row["program"] = ca.get("name", "")
+        out.append(row)
+    return out
+
+
+def parse_trace_dbaccesses(data: bytes) -> dict:
+    """Parse a trace dbAccesses response.
+
+    Returns {total_db_time, accesses:[{table, statement, type, total_count,
+    buffered_count, db_time, ratio, program}]}.
+    """
+    out = {"total_db_time": 0, "accesses": []}
+    if not data:
+        return out
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return out
+    def _i(s):
+        try:
+            return int((s or "0").strip())
+        except ValueError:
+            return 0
+    def _f(s):
+        try:
+            return float((s or "0").strip())
+        except ValueError:
+            return 0.0
+    out["total_db_time"] = _i({_localname(k): v
+                               for k, v in root.attrib.items()}.get("totalDbTime"))
+    for e in root.iter():
+        if _localname(e.tag) != "dbAccess":
+            continue
+        a = {_localname(k): v for k, v in e.attrib.items()}
+        row = {"table": a.get("tableName", ""), "statement": a.get("statement", ""),
+               "type": a.get("type", ""), "total_count": _i(a.get("totalCount")),
+               "buffered_count": _i(a.get("bufferedCount")), "db_time": 0,
+               "ratio": 0.0, "program": ""}
+        for c in e:
+            cln = _localname(c.tag)
+            ca = {_localname(k): v for k, v in c.attrib.items()}
+            if cln == "accessTime":
+                row["db_time"] = _i(ca.get("database") or ca.get("total"))
+                row["ratio"] = _f(ca.get("ratioOfTraceTotal"))
+            elif cln == "callingProgram" and not row["program"]:
+                row["program"] = ca.get("name", "")
+        out["accesses"].append(row)
     return out
 
 
@@ -364,6 +583,50 @@ def parse_cds_dependencies(source: str) -> list[dict]:
     return out
 
 
+def parse_bdef_dependencies(source: str) -> dict:
+    """Extract the artifacts a RAP behavior definition leans on.
+
+    Returns {"entities": [...], "classes": [...]}: the CDS entities behind
+    `define behavior for <Entity>` and the behavior-pool classes named in
+    `... implementation in class <Class>`. Pure text parse.
+    """
+    entities, ent_seen = [], set()
+    for m in re.finditer(r"\bdefine\s+behavior\s+for\s+([A-Za-z_/]\w*)",
+                         source, re.IGNORECASE):
+        n = m.group(1)
+        if n.upper() not in ent_seen:
+            ent_seen.add(n.upper())
+            entities.append(n)
+    classes, cls_seen = [], set()
+    for m in re.finditer(r"\bimplementation\s+in\s+class\s+([A-Za-z_/]\w*)",
+                         source, re.IGNORECASE):
+        n = m.group(1)
+        if n.upper() not in cls_seen:
+            cls_seen.add(n.upper())
+            classes.append(n)
+    return {"entities": entities, "classes": classes}
+
+
+def parse_class_dependencies(source: str) -> dict:
+    """Extract a class's superclass and implemented interfaces from source.
+
+    Returns {"superclass": name|None, "interfaces": [...]}. Pure text parse.
+    """
+    superclass = None
+    m = re.search(r"\binheriting\s+from\s+([A-Za-z_/]\w*)", source,
+                  re.IGNORECASE)
+    if m:
+        superclass = m.group(1)
+    interfaces, seen = [], set()
+    for m in re.finditer(r"^\s*interfaces\s+([A-Za-z_/]\w*)", source,
+                         re.IGNORECASE | re.MULTILINE):
+        n = m.group(1)
+        if n.upper() not in seen:
+            seen.add(n.upper())
+            interfaces.append(n)
+    return {"superclass": superclass, "interfaces": interfaces}
+
+
 def compress_source(object_type: str, source: str) -> str:
     """Strip a dependency's source down to the parts that matter for context.
 
@@ -498,6 +761,10 @@ def build_creation_body(object_type: str, name: str, package: str,
 class ADTClient:
     def __init__(self, client: httpx.Client):
         self._client = client
+        # CSRF tokens are session-scoped; cache per host so writes don't pay an
+        # extra discovery round-trip on every POST. Invalidated on a 403 that
+        # asks for a fresh token (x-csrf-token: Required).
+        self._csrf_cache: dict[str, str] = {}
 
     def source_url(self, system: System, object_type: str, name: str,
                    function_group: str | None) -> str:
@@ -551,9 +818,15 @@ class ADTClient:
         headers["Accept"] = accept
         return self._client.get(url, headers=headers, **kwargs)
 
-    def _csrf_token(self, system: System) -> str:
-        """Fetch a CSRF token for the current session (needed for POSTs)."""
-        url = f"{base_url(system.url)}/sap/bc/adt/discovery"
+    def _csrf_token(self, system: System, force: bool = False) -> str:
+        """Return a CSRF token for the session, cached per host.
+
+        force=True bypasses the cache (e.g. after the server rejected a token).
+        """
+        key = base_url(system.url)
+        if not force and key in self._csrf_cache:
+            return self._csrf_cache[key]
+        url = f"{key}/sap/bc/adt/discovery"
         kwargs = self._auth_kwargs(system)
         headers = kwargs.pop("headers", {})
         headers["X-CSRF-Token"] = "fetch"
@@ -562,22 +835,44 @@ class ADTClient:
             resp = self._client.get(url, headers=headers, **kwargs)
         except httpx.HTTPError:
             return ""
-        return resp.headers.get("x-csrf-token", "")
+        token = resp.headers.get("x-csrf-token", "")
+        if token:
+            self._csrf_cache[key] = token
+        return token
 
-    def _post(self, system: System, url: str, accept: str,
-              body: bytes | None = None, content_type: str | None = None):
-        """Low-level POST with auth + accept + CSRF token. Returns response or raises."""
+    @staticmethod
+    def _csrf_rejected(resp) -> bool:
+        """True if the server rejected the CSRF token and wants a fresh one."""
+        return (resp.status_code == 403
+                and resp.headers.get("x-csrf-token", "").lower() == "required")
+
+    def _post_once(self, system: System, url: str, accept: str, token: str,
+                   body: bytes | None, content_type: str | None):
         kwargs = self._auth_kwargs(system)
         headers = kwargs.pop("headers", {})
         headers["Accept"] = accept
         if content_type:
             headers["Content-Type"] = content_type
-        token = self._csrf_token(system)
         if token:
             headers["X-CSRF-Token"] = token
         if body is not None:
             kwargs["content"] = body
         return self._client.post(url, headers=headers, **kwargs)
+
+    def _post(self, system: System, url: str, accept: str,
+              body: bytes | None = None, content_type: str | None = None):
+        """Low-level POST with auth + accept + cached CSRF token.
+
+        On a 403 that asks for a fresh token, the cache is invalidated and the
+        POST is retried once with a newly fetched token.
+        """
+        resp = self._post_once(system, url, accept, self._csrf_token(system),
+                               body, content_type)
+        if self._csrf_rejected(resp):
+            resp = self._post_once(system, url, accept,
+                                   self._csrf_token(system, force=True),
+                                   body, content_type)
+        return resp
 
     def _fetch_source(self, system: System, url: str, label: str) -> str:
         """GET a source URL; return text or a human-readable error string."""
@@ -711,6 +1006,22 @@ class ADTClient:
                     f"— refresh cookies and retry")
         return parse_search(resp.content)
 
+    def _fetch_sources(self, system: System,
+                       objs: list[dict]) -> list[tuple[dict, str]]:
+        """Fetch each object's source concurrently, preserving input order.
+
+        Returns (obj, source) pairs; sources that errored keep their error
+        string so callers can decide to skip them. Concurrency cuts the
+        wall-clock cost of scanning large packages (many small GETs).
+        """
+        if not objs:
+            return []
+        workers = min(8, len(objs))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            srcs = ex.map(
+                lambda o: self.get_source_by_uri(system, o["uri"]), objs)
+            return list(zip(objs, srcs))
+
     def get_package_source(self, system: System, package: str,
                            max_objects: int = 50) -> str:
         objs = self.list_package(system, package)
@@ -719,16 +1030,12 @@ class ADTClient:
         sources = [o for o in objs if o["type"] != "DEVC/K" and o["uri"]]
         if not sources:
             return f"No source objects in package {package}"
-        chunks, used, truncated = [], 0, False
-        for o in sources:
-            if used >= max_objects:
-                truncated = True
-                break
-            src = self.get_source_by_uri(system, o["uri"])
+        truncated = len(sources) > max_objects
+        chunks = []
+        for o, src in self._fetch_sources(system, sources[:max_objects]):
             if src.startswith("Error:"):
                 continue
             chunks.append(f"* ==== {o['type']} {o['name']} ====\n{src}")
-            used += 1
         if not chunks:
             return f"No readable source in package {package}"
         out = "\n\n".join(chunks)
@@ -747,12 +1054,8 @@ class ADTClient:
         if isinstance(objs, str):
             return objs
         sources = [o for o in objs if o["type"] != "DEVC/K" and o["uri"]]
-        matches, scanned = [], 0
-        for o in sources:
-            if scanned >= max_objects:
-                break
-            scanned += 1
-            src = self.get_source_by_uri(system, o["uri"])
+        matches = []
+        for o, src in self._fetch_sources(system, sources[:max_objects]):
             if src.startswith("Error:"):
                 continue
             for n, line in enumerate(src.splitlines(), 1):
@@ -944,6 +1247,266 @@ class ADTClient:
         # Empty body => server returned nothing to change; keep the original.
         return resp.text if resp.text else source
 
+    # --- ABAP Unit test run ---
+
+    # Object-set URIs for a unit-test run (group-level for FUGR).
+    AUNIT_PATHS = {
+        "CLAS": "/sap/bc/adt/oo/classes/{name}",
+        "PROG": "/sap/bc/adt/programs/programs/{name}",
+        "FUGR": "/sap/bc/adt/functions/groups/{name}",
+    }
+
+    def run_unit_tests(self, system: System, object_type: str,
+                       name: str) -> str:
+        """Run ABAP Unit for a class/program/function group; report pass/fail.
+
+        Returns a per-method summary; failures include their assertion alerts.
+        """
+        ot = OBJECT_TYPE_ALIASES.get(object_type.upper(), object_type.upper())
+        if ot not in self.AUNIT_PATHS:
+            return (f"Error: cannot run unit tests for type {object_type!r}; "
+                    f"valid: {', '.join(self.AUNIT_PATHS)}")
+        uri = self.AUNIT_PATHS[ot].format(name=name.upper())
+        body = (
+            f'<?xml version="1.0" encoding="UTF-8"?>'
+            f'<aunit:runConfiguration '
+            f'xmlns:aunit="http://www.sap.com/adt/aunit">'
+            f'<external><coverage active="false"/></external>'
+            # The <options> block is mandatory: without explicit risk levels
+            # and durations the server returns an empty runResult (no tests
+            # "selected"), which looks like "no tests found". Run them all.
+            f'<options>'
+            f'<uriType value="semantic"/>'
+            f'<testDeterminationStrategy sameProgram="true" '
+            f'assignedTests="false" appendAssignedTestsPreview="true"/>'
+            f'<testRiskLevels harmless="true" dangerous="true" '
+            f'critical="true"/>'
+            f'<testDurations short="true" medium="true" long="true"/>'
+            f'</options>'
+            f'<adtcore:objectSets xmlns:adtcore="http://www.sap.com/adt/core">'
+            f'<objectSet kind="inclusive">'
+            f'<adtcore:objectReferences>'
+            f'<adtcore:objectReference adtcore:uri="{uri}"/>'
+            f'</adtcore:objectReferences>'
+            f'</objectSet>'
+            f'</adtcore:objectSets>'
+            f'</aunit:runConfiguration>').encode("utf-8")
+        url = f"{base_url(system.url)}/sap/bc/adt/abapunit/testruns"
+        ct = "application/vnd.sap.adt.abapunit.testruns.config.v4+xml"
+        accept = "application/vnd.sap.adt.abapunit.testruns.result.v2+xml"
+        try:
+            resp = self._post(system, url, accept, body, ct)
+        except httpx.HTTPError as e:
+            return f"Error: unit test request failed: {e}"
+        if resp.status_code != 200:
+            return (f"Error: unit test run failed (HTTP {resp.status_code}): "
+                    f"{resp.text[:300]}")
+        if is_login_page(resp):
+            return (f"Error: session expired for system {system.name!r} "
+                    f"— refresh cookies and retry")
+        methods = parse_aunit_result(resp.content)
+        if not methods:
+            return (f"No ABAP Unit tests found for {ot} {name.upper()}")
+
+        def failed(m: dict) -> bool:
+            return any(a["severity"].lower() in ("critical", "fatal")
+                       for a in m["alerts"])
+
+        n_failed = sum(1 for m in methods if failed(m))
+        lines = [f"{len(methods)} test method(s), {n_failed} failed "
+                 f"in {ot} {name.upper()}:"]
+        for m in methods:
+            tag = "FAIL" if failed(m) else "ok"
+            t = f" ({m['time']}s)" if m["time"] else ""
+            lines.append(f"  [{tag}] {m['class']}->{m['method']}{t}")
+            for a in m["alerts"]:
+                lines.append(f"      {a['severity']}: {a['title']}")
+                for d in a["details"]:
+                    lines.append(f"        {d}")
+        return "\n".join(lines)
+
+    # --- Data preview (CDS view / Open SQL) ---
+
+    def data_preview(self, system: System, query: str,
+                     max_rows: int = 100) -> str:
+        """Preview data for a CDS entity name or an Open SQL SELECT.
+
+        A bare entity name is wrapped as `SELECT * FROM <name>`. Returns a
+        text table (columns + up to max_rows rows).
+        """
+        q = (query or "").strip()
+        if not q:
+            return "Error: empty query"
+        if not re.search(r"\bselect\b", q, re.IGNORECASE):
+            q = f"SELECT * FROM {q}"
+        url = (f"{base_url(system.url)}/sap/bc/adt/datapreview/freestyle"
+               f"?rowNumber={max_rows}")
+        accept = "application/vnd.sap.adt.datapreview.table.v1+xml"
+        try:
+            resp = self._post(system, url, accept,
+                              q.encode("utf-8"), "text/plain")
+        except httpx.HTTPError as e:
+            return f"Error: data preview request failed: {e}"
+        if resp.status_code != 200:
+            return (f"Error: data preview failed (HTTP {resp.status_code}): "
+                    f"{resp.text[:300]}")
+        if is_login_page(resp):
+            return (f"Error: session expired for system {system.name!r} "
+                    f"— refresh cookies and retry")
+        res = parse_data_preview(resp.content)
+        cols, rows = res["columns"], res["rows"]
+        if not cols:
+            return f"(no columns returned) query: {q}"
+        widths = [len(c) for c in cols]
+        for r in rows:
+            for i, v in enumerate(r):
+                widths[i] = max(widths[i], len(v))
+        def fmt(vals):
+            return " | ".join(v.ljust(widths[i]) for i, v in enumerate(vals))
+        out = [fmt(cols), "-+-".join("-" * w for w in widths)]
+        out += [fmt(r) for r in rows]
+        out.append(f"({len(rows)} row(s) shown, total {res['total']})")
+        return "\n".join(out)
+
+    # --- ABAP Profiler (runtime traces) ---
+
+    TRACES_BASE = "/sap/bc/adt/runtime/traces/abaptraces"
+
+    def trace_start(self, system: System, process_type: str = "http",
+                    object_type: str = "url", title: str = "ai-trace",
+                    max_executions: int = 3, expires_minutes: int = 60,
+                    aggregate: bool = False) -> str:
+        """Arm an ABAP profiler trace for the caller's next executions.
+
+        After this, run the slow workload (Fiori/OData → process_type 'http';
+        a console class → 'dialog'/'batch'; data_preview also counts as 'http').
+        Then call trace_list + trace_analyze. The trace auto-expires.
+        """
+        import datetime
+        pbody = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<trc:parameters xmlns:trc="http://www.sap.com/adt/runtime/traces/'
+            'abaptraces">'
+            '<trc:allMiscAbapStatements value="false"/>'
+            '<trc:allProceduralUnits value="true"/>'
+            '<trc:allInternalTableEvents value="false"/>'
+            '<trc:allDynproEvents value="false"/>'
+            f'<trc:description value="{title}"/>'
+            f'<trc:aggregate value="{"true" if aggregate else "false"}"/>'
+            '<trc:explicitOnOff value="false"/>'
+            '<trc:withRfcTracing value="false"/>'
+            '<trc:allSystemKernelEvents value="false"/>'
+            '<trc:sqlTrace value="false"/>'
+            '<trc:allDbEvents value="true"/>'
+            '<trc:maxSizeForTraceFile value="30720"/>'
+            '<trc:maxTimeForTracing value="1800"/>'
+            '</trc:parameters>').encode("utf-8")
+        purl = f"{base_url(system.url)}{self.TRACES_BASE}/parameters"
+        try:
+            pr = self._post(system, purl, "application/xml", pbody,
+                            "application/xml")
+        except httpx.HTTPError as e:
+            return f"Error: trace parameters request failed: {e}"
+        if pr.status_code != 200:
+            return (f"Error: trace parameters failed (HTTP {pr.status_code}): "
+                    f"{pr.text[:200]}")
+        pid = pr.headers.get("location", "")
+        m = re.search(rf"({re.escape(self.TRACES_BASE)}/parameters/\w+)",
+                      pid + " " + pr.text)
+        if not m:
+            return f"Error: no parametersId returned: {pr.text[:200]}"
+        pid = m.group(1)
+        expires = (datetime.datetime.utcnow()
+                   + datetime.timedelta(minutes=expires_minutes)
+                   ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        pt = f"{self.TRACES_BASE}/processtypes/{process_type.lower()}"
+        ot = f"{self.TRACES_BASE}/objecttypes/{object_type.lower()}"
+        qs = (f"?server=*&description={quote(title)}"
+              f"&processType={quote(pt, safe='')}"
+              f"&objectType={quote(ot, safe='')}"
+              f"&expires={quote(expires, safe='')}"
+              f"&maximalExecutions={max_executions}"
+              f"&parametersId={quote(pid, safe='')}")
+        rurl = f"{base_url(system.url)}{self.TRACES_BASE}/requests{qs}"
+        try:
+            rr = self._post(system, rurl, "application/atom+xml;type=feed")
+        except httpx.HTTPError as e:
+            return f"Error: trace request failed: {e}"
+        if rr.status_code not in (200, 201):
+            return (f"Error: trace request failed (HTTP {rr.status_code}): "
+                    f"{rr.text[:200]}")
+        return (f"OK: trace armed (process={process_type}, "
+                f"max_executions={max_executions}, expires in "
+                f"{expires_minutes}min). Run the workload now, then call "
+                f"trace_list and trace_analyze.")
+
+    def trace_list(self, system: System, max_runs: int = 20) -> str:
+        """List the caller's recorded ABAP profiler runs (newest first)."""
+        url = f"{base_url(system.url)}{self.TRACES_BASE}"
+        try:
+            resp = self._get(system, url, "application/atom+xml;type=feed")
+        except httpx.HTTPError as e:
+            return f"Error: trace list request failed: {e}"
+        if resp.status_code != 200:
+            return f"Error: trace list failed (HTTP {resp.status_code})"
+        if is_login_page(resp):
+            return (f"Error: session expired for system {system.name!r} "
+                    f"— refresh cookies and retry")
+        runs = parse_trace_runs(resp.content)
+        if not runs:
+            return ("No trace runs found. Use trace_start, run the workload, "
+                    "then retry.")
+        runs.sort(key=lambda r: r["date"], reverse=True)  # newest first
+        lines = ["Trace runs (time in ms; total / ABAP / DB):"]
+        for r in runs[:max_runs]:
+            lines.append(
+                f"  {r['date']}  {r['title']}  "
+                f"{r['runtime']/1000:.1f} / {r['runtime_abap']/1000:.1f} / "
+                f"{r['runtime_db']/1000:.1f} ms  [{r['state']}]\t{r['uri']}")
+        return "\n".join(lines)
+
+    def trace_analyze(self, system: System, trace_uri: str, top: int = 15,
+                      with_system_events: bool = False) -> str:
+        """Digest one trace: top time consumers (hitlist) + DB accesses."""
+        if not trace_uri:
+            return "Error: trace_uri is required"
+        se = "true" if with_system_events else "false"
+        hurl = f"{base_url(system.url)}{trace_uri}/hitlist?withSystemEvents={se}"
+        durl = (f"{base_url(system.url)}{trace_uri}/dbAccesses"
+                f"?withSystemEvents={se}")
+        try:
+            hr = self._get(system, hurl, "application/xml")
+            dr = self._get(
+                system, durl,
+                "application/vnd.sap.adt.runtime.traces.abaptraces.dbaccesses"
+                "+xml, application/xml")
+        except httpx.HTTPError as e:
+            return f"Error: trace analyze request failed: {e}"
+        if hr.status_code != 200:
+            return f"Error: hitlist failed (HTTP {hr.status_code})"
+        if is_login_page(hr):
+            return (f"Error: session expired for system {system.name!r} "
+                    f"— refresh cookies and retry")
+        hits = parse_trace_hitlist(hr.content)
+        out = [f"Trace {trace_uri}", "", "Top time consumers (gross%):"]
+        for h in sorted(hits, key=lambda x: x["gross_pct"], reverse=True)[:top]:
+            prog = f"  [{h['program']}]" if h["program"] else ""
+            out.append(f"  {h['gross_pct']:5.1f}%  {h['gross_time']/1000:8.1f}ms  "
+                       f"{h['description']}{prog}")
+        if dr.status_code == 200:
+            db = parse_trace_dbaccesses(dr.content)
+            total_db = db["total_db_time"] or sum(
+                a["db_time"] for a in db["accesses"])
+            out += ["", f"DB accesses (total {total_db/1000:.1f}ms) "
+                    f"— table / stmt / count / buffered / db_ms / ratio:"]
+            for a in sorted(db["accesses"], key=lambda x: x["db_time"],
+                            reverse=True)[:top]:
+                out.append(
+                    f"  {a['table']:<28} {a['statement']:<14} "
+                    f"{a['total_count']:>6} {a['buffered_count']:>6} "
+                    f"{a['db_time']/1000:8.1f} {a['ratio']:5.1f}%")
+        return "\n".join(out)
+
     # --- API release state (ABAP Cloud / Clean Core) ---
 
     def api_release_state(self, system: System, object_type: str, name: str,
@@ -997,13 +1560,20 @@ class ADTClient:
 
     # --- Context compression (v2 Phase 6) ---
 
+    @staticmethod
+    def _is_custom(name: str) -> bool:
+        up = name.upper()
+        return up[:1] in ("Z", "Y") or up.startswith("/")
+
     def get_context(self, system: System, object_type: str, name: str,
                     depth: int = 1, max_objects: int = 20) -> str:
-        """Bundle an object's full source + compressed CDS dependencies.
+        """Bundle an object's full source + its compressed dependencies.
 
-        v1 resolves dependencies for CDS (DDLS) objects via their source
-        (FROM/JOIN/ASSOCIATION/COMPOSITION), recursing up to `depth`. Custom
-        (Z*/Y*/namespaced) deps are fetched and compressed; standard SAP
+        DDLS (CDS): recurse FROM/JOIN/ASSOCIATION/COMPOSITION up to `depth`.
+        BDEF (RAP behavior): pull the behavior-for CDS (with its own CDS deps)
+        and the behavior-pool implementation class.
+        CLAS: pull the superclass and implemented interfaces.
+        Custom (Z*/Y*/namespaced) deps are fetched and compressed; standard SAP
         objects are listed but not expanded (token economy).
         """
         main = self.get_source(system, object_type, name)
@@ -1011,10 +1581,35 @@ class ADTClient:
             return main
         ot = object_type.upper()
         blocks = [f"* ==== {ot} {name.upper()} (full source) ====", main]
-        if ot != "DDLS":
-            return "\n".join(blocks)
+        if ot == "DDLS":
+            self._expand_cds_context(system, name, blocks, {name.upper()},
+                                     depth, max_objects)
+        elif ot == "BDEF":
+            self._expand_bdef_context(system, main, blocks, depth, max_objects)
+        elif ot == "CLAS":
+            self._expand_class_context(system, main, blocks)
+        return "\n".join(blocks)
 
-        visited = {name.upper()}
+    def _add_dep_block(self, system: System, blocks: list, relation: str,
+                       name: str, object_type: str) -> str:
+        """Fetch a custom dep, append a compressed block; return its status.
+
+        Standard SAP objects are listed but not fetched. Returns "expanded",
+        "standard" or "unresolved" so callers can decide whether to recurse.
+        """
+        if not self._is_custom(name):
+            blocks.append(f"* ---- {relation} {name} (standard, not expanded) ----")
+            return "standard"
+        src = self.get_source(system, object_type, name)
+        if src.startswith("Error:"):
+            blocks.append(f"* ---- {relation} {name} (unresolved) ----")
+            return "unresolved"
+        blocks.append(f"* ---- {relation} {name} [{object_type}, compressed] ----")
+        blocks.append(compress_source(object_type, src))
+        return "expanded"
+
+    def _expand_cds_context(self, system: System, name: str, blocks: list,
+                            visited: set, depth: int, max_objects: int) -> None:
         frontier = [(name, 1)]
         count = 0
         while frontier and count < max_objects:
@@ -1030,8 +1625,7 @@ class ADTClient:
                 count += 1
                 if count > max_objects:
                     break
-                is_custom = up[:1] in ("Z", "Y") or up.startswith("/")
-                if not is_custom:
+                if not self._is_custom(dn):
                     blocks.append(f"* ---- {d['relation']} {dn} "
                                   f"(standard, not expanded) ----")
                     continue
@@ -1048,7 +1642,28 @@ class ADTClient:
                 blocks.append(compress_source(otype, src))
                 if otype == "DDLS" and lvl < depth:
                     frontier.append((dn, lvl + 1))
-        return "\n".join(blocks)
+
+    def _expand_bdef_context(self, system: System, main: str, blocks: list,
+                             depth: int, max_objects: int) -> None:
+        deps = parse_bdef_dependencies(main)
+        visited: set = set()
+        for ent in deps["entities"]:
+            if self._add_dep_block(system, blocks, "BEHAVIOR_FOR", ent,
+                                   "DDLS") == "expanded":
+                visited.add(ent.upper())
+                self._expand_cds_context(system, ent, blocks, visited,
+                                         depth, max_objects)
+        for cls in deps["classes"]:
+            self._add_dep_block(system, blocks, "IMPL_CLASS", cls, "CLAS")
+
+    def _expand_class_context(self, system: System, main: str,
+                              blocks: list) -> None:
+        deps = parse_class_dependencies(main)
+        if deps["superclass"]:
+            self._add_dep_block(system, blocks, "SUPERCLASS",
+                                deps["superclass"], "CLAS")
+        for intf in deps["interfaces"]:
+            self._add_dep_block(system, blocks, "INTERFACE", intf, "INTF")
 
     # --- Write: stateful primitives (v_write Phase A) ---
 
@@ -1056,11 +1671,26 @@ class ADTClient:
                         function_group: str | None = None) -> str:
         return f"{base_url(system.url)}{object_root_path(object_type, name, function_group)}"
 
+    def _prime_cookies(self, system: System) -> None:
+        """Load a cookie system's session into the client's cookie jar, scoped
+        to the host. The stateful write sequence then relies on the jar (no
+        per-request override) so a session-id the server rotates mid-sequence
+        (Set-Cookie on LOCK) is carried into the following PUT/UNLOCK."""
+        host = urlsplit(base_url(system.url)).hostname or ""
+        jar = self._client.cookies
+        for k, v in (self._cookies_dict(system) or {}).items():
+            jar.set(k, v, domain=host)
+
     def _write_kwargs(self, system: System) -> dict:
-        """Auth kwargs for the stateful write sequence (cookies as dict)."""
+        """Auth kwargs for the stateful write sequence.
+
+        Cookie systems prime the jar and pass nothing (the jar is the single
+        source of truth, respecting server-side session rotation); basic-auth
+        systems pass credentials per request.
+        """
         if system.auth == "cookie":
-            cookies = self._cookies_dict(system) or {}
-            return {"cookies": cookies}
+            self._prime_cookies(system)
+            return {}
         return {"auth": httpx.BasicAuth(system.username or "",
                                         system.password or "")}
 
@@ -1098,17 +1728,27 @@ class ADTClient:
         except httpx.HTTPError as e:
             return f"Error: update request failed: {e}"
         if resp.status_code in (200, 201, 202):
+            if is_login_page(resp):
+                return (f"Error: session expired for system {system.name!r} "
+                        f"during write (got SAML login page) — refresh cookies "
+                        f"and retry")
             return None
+        if resp.status_code in (401, 403):
+            return (f"Error: auth failed during write (HTTP {resp.status_code}) "
+                    f"for system {system.name!r} — cookie/session expired; "
+                    f"refresh cookies and retry")
         return f"Error: update failed (HTTP {resp.status_code}): {resp.text[:300]}"
 
     def _unlock(self, system: System, root_url: str, handle: str,
-                token: str, wk: dict) -> None:
+                token: str, wk: dict) -> bool:
+        """Release the lock; return True if the server confirmed the unlock."""
         url = f"{root_url}?_action=UNLOCK&lockHandle={quote(handle, safe='')}"
         headers = {"X-sap-adt-sessiontype": "stateful", "X-CSRF-Token": token}
         try:
-            self._client.post(url, headers=headers, **wk)
+            resp = self._client.post(url, headers=headers, **wk)
+            return resp.status_code in (200, 202, 204)
         except httpx.HTTPError:
-            pass
+            return False
 
     def activate(self, system: System, object_type: str, name: str,
                  function_group: str | None = None) -> str:
@@ -1162,11 +1802,14 @@ class ADTClient:
         handle, err = self._lock(system, root_url, token, wk)
         if err:
             return err
-        try:
-            return self._put_source(system, source_url, source, handle,
-                                    transport, token, wk)
-        finally:
-            self._unlock(system, root_url, handle, token, wk)
+        put_err = self._put_source(system, source_url, source, handle,
+                                   transport, token, wk)
+        unlocked = self._unlock(system, root_url, handle, token, wk)
+        if put_err and not unlocked:
+            return (put_err + f" — the object may remain locked on system "
+                    f"{system.name!r}; run refresh_cookies_for and retry "
+                    f"(a fresh session releases the stale lock)")
+        return put_err
 
     def update_source(self, system: System, object_type: str, name: str,
                       source: str, transport: str | None = None,
