@@ -1,12 +1,41 @@
 """Entry point: `python -m adt_mcp` runs MCP + web admin on one port."""
+import logging
 import os
+
 import httpx
+from uvicorn.config import LOGGING_CONFIG
+
 from .registry import SystemRegistry
 from .adt_client import ADTClient
 from .server import build_server
 
+_DATEFMT = "%Y-%m-%d %H:%M:%S"
+
+
+def configure_logging() -> None:
+    """Prefix every log line with a timestamp.
+
+    FastMCP builds uvicorn's Config without a custom log_config, so uvicorn's
+    default formatters (which omit asctime) are used and its access logger does
+    not propagate to root. Patch uvicorn's own formatters in place, and set a
+    timestamped root format too (covers httpx 'HTTP Request' lines and ours).
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt=_DATEFMT,
+    )
+    fmts = LOGGING_CONFIG["formatters"]
+    fmts["default"]["fmt"] = "%(asctime)s %(levelprefix)s %(message)s"
+    fmts["default"]["datefmt"] = _DATEFMT
+    fmts["access"]["fmt"] = (
+        '%(asctime)s %(levelprefix)s %(client_addr)s - '
+        '"%(request_line)s" %(status_code)s')
+    fmts["access"]["datefmt"] = _DATEFMT
+
 
 def main() -> None:
+    configure_logging()
     base = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
     systems_path = os.environ.get(
         "ADT_MCP_SYSTEMS", os.path.join(base, "systems.json"))
@@ -17,7 +46,8 @@ def main() -> None:
     mcp = build_server(registry, adt)
     mcp.settings.port = port
     mcp.settings.host = "127.0.0.1"
-    print(f"ADT MCP on http://127.0.0.1:{port}  (MCP at /mcp, admin at /)")
+    logging.getLogger("adt_mcp").info(
+        "ADT MCP on http://127.0.0.1:%s  (MCP at /mcp, admin at /)", port)
     mcp.run(transport="streamable-http")
 
 
