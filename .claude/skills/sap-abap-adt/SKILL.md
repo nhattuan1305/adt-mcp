@@ -11,9 +11,15 @@ as `mcp__sap-adt__<tool>`. Every tool takes a `system` argument.
 ## Always first
 1. `list_systems` → get the exact system name (e.g. `sap-vnext`). **Every** tool
    needs `system`; an unknown name returns a clear error listing valid ones.
-2. If any call returns **"session expired … refresh cookies"** → call
-   `refresh_cookies_for(system)` once, then retry. (Only works if that system
-   has stored credentials; otherwise the user must re-login in the web admin.)
+2. If a call returns **"session expired … refresh cookies"** → call
+   `refresh_cookies_for(system)` once, then retry. It runs a **headless login
+   with the system's stored username/password** (offloaded to a worker thread,
+   so it no longer crashes with *"Playwright Sync API inside the asyncio loop"*).
+   It works **only** when credentials are stored; a cookie/browser-login system
+   with no stored password returns *"needs username and password"* → the user
+   must re-login from the web admin instead (its refresh can open an interactive
+   browser, which needs a desktop — on a headless service host, do it over RDP:
+   `Stop-Service adt-mcp` → run foreground → browser login → `Start-Service`).
 
 ## Object type codes
 `CLAS` class · `INTF` interface · `PROG` program · `INCL` include · `FUGR`
@@ -42,10 +48,10 @@ metadata extension · `BDEF` RAP behavior definition · `SRVD` service definitio
 | `get_context(object_type,name[,depth])` | **one-call big picture**: DDLS→CDS deps; BDEF→behavior-for CDS + impl class; CLAS→superclass + interfaces (custom expanded, standard listed) |
 | `find_references(object_uri[,line,column])` | where-used (downstream) |
 | `cds_dependencies(ddls_name)` | upstream FROM/JOIN/ASSOCIATION/COMPOSITION of a CDS |
-| `api_release_state(object_type,name)` | released for ABAP Cloud? (Clean Core contracts) |
+| `api_release_state(object_type,name[,function_group])` | released for ABAP Cloud? (Clean Core contracts) |
 
 **History**
-| `get_revisions(object_type,name[,function_group,include])` · `get_revision_source(version_uri)` · `compare_source(object_type,name,version_uri[,against])` (unified diff) |
+| `get_revisions(object_type,name[,function_group,include])` · `get_revision_source(version_uri)` · `compare_source(object_type,name,version_uri[,against,function_group])` (unified diff) |
 
 **Quality / runtime**
 | tool | use |
