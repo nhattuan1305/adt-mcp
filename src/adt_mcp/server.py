@@ -382,9 +382,12 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
                                  binding_version)
 
     @tool("refresh_cookies_for")
-    def refresh_cookies_for(system: str) -> str:
+    async def refresh_cookies_for(system: str) -> str:
         """Refresh expired session cookies (headless login with stored creds). Use when calls report session expired."""
-        return resolve_and_refresh(registry, system)
+        # resolve_and_refresh drives sync Playwright; FastMCP runs sync tools
+        # directly in the event loop thread, where sync_playwright() raises.
+        # Offload to a worker thread like the web-admin routes do.
+        return await anyio.to_thread.run_sync(resolve_and_refresh, registry, system)
 
     web_dir = os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "web")
