@@ -731,15 +731,24 @@ CREATE_TYPES = {
 def build_creation_body(object_type: str, name: str, package: str,
                         description: str, responsible: str,
                         service_definition: str | None = None,
-                        binding_version: str = "V2") -> str:
+                        binding_version: str = "V2",
+                        language: str = "EN") -> str:
     ot = object_type.upper()
     path, root, ns, adt_type, _ct, _sc = CREATE_TYPES[ot]
     name = name.upper()
     package = package.upper()
+    lang = (language or "EN").upper()
+    # adtcore:language + adtcore:masterLanguage are REQUIRED by the ADT object
+    # simple transformations (CLASS_TRANSFORMATION, SEDI_ADT_PROGRAM,
+    # SDDIC_ST_ADT_DDLS, SADT_BLUE_SOURCE, ...). Omitting them makes every
+    # create POST fail with "error … deserializing in the simple transformation
+    # program <X>" (HTTP 400). Matches abap-adt-api's creation body.
     head = (f'<?xml version="1.0" encoding="UTF-8"?>\n'
             f'<{root} {ns} xmlns:adtcore="http://www.sap.com/adt/core" '
             f'adtcore:description="{description}" adtcore:name="{name}" '
-            f'adtcore:type="{adt_type}" adtcore:responsible="{responsible}"')
+            f'adtcore:type="{adt_type}" adtcore:language="{lang}" '
+            f'adtcore:masterLanguage="{lang}" '
+            f'adtcore:responsible="{responsible}"')
     if ot == "SRVD":
         head += ' srvd:srvdSourceType="S"'
     if ot == "SRVB":
@@ -1881,7 +1890,8 @@ class ADTClient:
             return "Error: SRVB requires service_definition"
         responsible = (system.username or "").upper() or "CB0000000000"
         body = build_creation_body(ot, name, package, description, responsible,
-                                   service_definition, binding_version)
+                                   service_definition, binding_version,
+                                   language=system.language)
         url = f"{base_url(system.url)}{path}"
         if transport:
             url += f"?corrNr={quote(transport, safe='')}"

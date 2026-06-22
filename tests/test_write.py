@@ -54,6 +54,18 @@ def test_parse_activation():
     assert "syntax error" in parse_activation(err)
 
 
+def test_build_creation_body_includes_master_language():
+    # Without adtcore:language + adtcore:masterLanguage every ADT create POST
+    # fails with "deserializing in the simple transformation program ..." (400).
+    for ot in ("CLAS", "PROG", "DDLS", "BDEF", "TABL"):
+        body = build_creation_body(ot, "ZX", "ZP", "d", "U", language="DE")
+        assert 'adtcore:language="DE"' in body, ot
+        assert 'adtcore:masterLanguage="DE"' in body, ot
+    # defaults to EN when no language given
+    assert 'adtcore:masterLanguage="EN"' in build_creation_body(
+        "CLAS", "ZX", "ZP", "d", "U")
+
+
 def test_build_creation_body_srvd_and_srvb():
     srvd = build_creation_body("SRVD", "zsd", "ZP", "d", "U")
     assert 'srvd:srvdSourceType="S"' in srvd and 'adtcore:name="ZSD"' in srvd
