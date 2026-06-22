@@ -373,7 +373,7 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
                       transport: str | None = None,
                       service_definition: str | None = None,
                       binding_version: str = "V2") -> str:
-        """Create RAP object (write; needs allow_write). Types CLAS/PROG/INTF/DDLS/DDLX/BDEF/SRVD/SRVB/TABL. package must exist; transport for transportable pkgs; source (if given) is written+activated; SRVB needs service_definition."""
+        """Create RAP object (write; needs allow_write). Types CLAS/PROG/INTF/DDLS/DDLX/DCLS/DTEL/DOMA/BDEF/SRVD/SRVB/TABL. package must exist; transport for transportable pkgs; source (if given) is written+activated; SRVB needs service_definition."""
         sys, err = _resolve(system)
         if err:
             return err
