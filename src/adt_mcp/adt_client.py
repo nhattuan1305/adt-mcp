@@ -44,6 +44,7 @@ OBJECT_PATHS = {
     "VIEW": "/sap/bc/adt/ddic/views/{name}/source/main",
     "STRU": "/sap/bc/adt/ddic/structures/{name}/source/main",
     "DDLX": "/sap/bc/adt/ddic/ddlx/sources/{name}/source/main",
+    "DCLS": "/sap/bc/adt/acm/dcl/sources/{name}/source/main",
 }
 
 # Accept aliases for object types
@@ -725,6 +726,17 @@ CREATE_TYPES = {
     "TABL": ("/sap/bc/adt/ddic/tables", "blue:blueSource",
              'xmlns:blue="http://www.sap.com/wbobj/blue"',
              "TABL/DT", "application/*", True),
+    # DCLS = access control (CDS DCL source). DTEL/DOMA are property objects,
+    # not source-based — create the shell only (source_capable=False).
+    "DCLS": ("/sap/bc/adt/acm/dcl/sources", "dcl:dclSource",
+             'xmlns:dcl="http://www.sap.com/adt/acm/dclsources"',
+             "DCLS/DL", "application/*", True),
+    "DTEL": ("/sap/bc/adt/ddic/dataelements", "blue:wbobj",
+             'xmlns:blue="http://www.sap.com/wbobj/dictionary/dtel"',
+             "DTEL/DE", "application/*", False),
+    "DOMA": ("/sap/bc/adt/ddic/domains", "domain:domain",
+             'xmlns:domain="http://www.sap.com/dictionary/domain"',
+             "DOMA/DD", "application/*", False),
 }
 
 
