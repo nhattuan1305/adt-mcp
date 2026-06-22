@@ -725,7 +725,7 @@ CREATE_TYPES = {
              "SRVB/SVB", "application/*", False),
     "TABL": ("/sap/bc/adt/ddic/tables", "blue:blueSource",
              'xmlns:blue="http://www.sap.com/wbobj/blue"',
-             "TABL/DT", "application/*", True),
+             "TABL/DT", "application/vnd.sap.adt.tables.v2+xml", True),
     # DCLS = access control (CDS DCL source). DTEL/DOMA are property objects,
     # not source-based — create the shell only (source_capable=False).
     "DCLS": ("/sap/bc/adt/acm/dcl/sources", "dcl:dclSource",
@@ -760,13 +760,21 @@ def build_creation_body(object_type: str, name: str, package: str,
     #    object S_ABPLNGVS ("not authorized to make changes"). On ABAP Cloud it
     #    must be "cloudDevelopment". Verified against my422346 (DDLS/DDLX/SRVD/
     #    TABL create return 201 only with all three present).
+    # adtcore:responsible maps to the ABAP user field XUBNAME (CHAR12). Emit it
+    # only when it's a plausible SAP user name (<=12 chars, no '@'); an IAS email
+    # login (e.g. "nhatpd@vnext.vn") or any over-long value makes SADT_BLUE_SOURCE
+    # fail to deserialize (400, XML offset at the responsible attr). When omitted
+    # the server fills it from the session user — verified to return 201.
+    resp = (responsible or "").strip()
+    resp_attr = (f' adtcore:responsible="{resp}"'
+                 if resp and "@" not in resp and len(resp) <= 12 else "")
     head = (f'<?xml version="1.0" encoding="UTF-8"?>\n'
             f'<{root} {ns} xmlns:adtcore="http://www.sap.com/adt/core" '
             f'adtcore:description="{description}" adtcore:name="{name}" '
             f'adtcore:type="{adt_type}" adtcore:language="{lang}" '
             f'adtcore:masterLanguage="{lang}" '
-            f'adtcore:abapLanguageVersion="{alv}" '
-            f'adtcore:responsible="{responsible}"')
+            f'adtcore:abapLanguageVersion="{alv}"'
+            f'{resp_attr}')
     if ot == "SRVD":
         head += ' srvd:srvdSourceType="S"'
     if ot == "SRVB":
@@ -1906,7 +1914,10 @@ class ADTClient:
         path, root, ns, adt_type, content_type, source_capable = CREATE_TYPES[ot]
         if ot == "SRVB" and not service_definition:
             return "Error: SRVB requires service_definition"
-        responsible = (system.username or "").upper() or "CB0000000000"
+        # Pass the raw login as responsible; build_creation_body drops it when
+        # it isn't a valid XUBNAME (e.g. an IAS email) and lets the server fill
+        # it from the session user.
+        responsible = (system.username or "").upper()
         body = build_creation_body(ot, name, package, description, responsible,
                                    service_definition, binding_version,
                                    language=system.language)
