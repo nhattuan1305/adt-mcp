@@ -732,22 +732,28 @@ def build_creation_body(object_type: str, name: str, package: str,
                         description: str, responsible: str,
                         service_definition: str | None = None,
                         binding_version: str = "V2",
-                        language: str = "EN") -> str:
+                        language: str = "EN",
+                        abap_language_version: str = "cloudDevelopment") -> str:
     ot = object_type.upper()
     path, root, ns, adt_type, _ct, _sc = CREATE_TYPES[ot]
     name = name.upper()
     package = package.upper()
     lang = (language or "EN").upper()
-    # adtcore:language + adtcore:masterLanguage are REQUIRED by the ADT object
-    # simple transformations (CLASS_TRANSFORMATION, SEDI_ADT_PROGRAM,
-    # SDDIC_ST_ADT_DDLS, SADT_BLUE_SOURCE, ...). Omitting them makes every
-    # create POST fail with "error … deserializing in the simple transformation
-    # program <X>" (HTTP 400). Matches abap-adt-api's creation body.
+    alv = abap_language_version or "cloudDevelopment"
+    # Three attributes are mandatory on ABAP Cloud (S/4HANA Cloud Public, BTP):
+    #  - adtcore:language + adtcore:masterLanguage: without them the create POST
+    #    fails "deserializing in the simple transformation program <X>" (400).
+    #  - adtcore:abapLanguageVersion: without it the server defaults to the
+    #    classic version and rejects the write with HTTP 403 / authorization
+    #    object S_ABPLNGVS ("not authorized to make changes"). On ABAP Cloud it
+    #    must be "cloudDevelopment". Verified against my422346 (DDLS/DDLX/SRVD/
+    #    TABL create return 201 only with all three present).
     head = (f'<?xml version="1.0" encoding="UTF-8"?>\n'
             f'<{root} {ns} xmlns:adtcore="http://www.sap.com/adt/core" '
             f'adtcore:description="{description}" adtcore:name="{name}" '
             f'adtcore:type="{adt_type}" adtcore:language="{lang}" '
             f'adtcore:masterLanguage="{lang}" '
+            f'adtcore:abapLanguageVersion="{alv}" '
             f'adtcore:responsible="{responsible}"')
     if ot == "SRVD":
         head += ' srvd:srvdSourceType="S"'

@@ -66,6 +66,16 @@ def test_build_creation_body_includes_master_language():
         "CLAS", "ZX", "ZP", "d", "U")
 
 
+def test_build_creation_body_includes_abap_language_version():
+    # On ABAP Cloud, omitting adtcore:abapLanguageVersion makes the server
+    # default to the classic version and reject the write with HTTP 403 /
+    # authorization object S_ABPLNGVS. It must be "cloudDevelopment".
+    for ot in ("CLAS", "DDLS", "TABL", "SRVD", "SRVB"):
+        body = build_creation_body(ot, "ZX", "ZP", "d", "U",
+                                   service_definition="ZSD")
+        assert 'adtcore:abapLanguageVersion="cloudDevelopment"' in body, ot
+
+
 def test_build_creation_body_srvd_and_srvb():
     srvd = build_creation_body("SRVD", "zsd", "ZP", "d", "U")
     assert 'srvd:srvdSourceType="S"' in srvd and 'adtcore:name="ZSD"' in srvd

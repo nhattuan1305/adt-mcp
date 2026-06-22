@@ -1,8 +1,9 @@
 {
-    "mcpServers": {
-        "sap-adt": {
-            "type": "http",
-            "url": "http://127.0.0.1:8765/mcp"
-        }
+  "mcpServers": {
+    "sap-adt": {
+      "type": "http",
+      "url": "https://104-215-184-253.sslip.io/mcp",
+      "headers": { "Authorization": "Basic dGVhbTpWbmV4dDIwMjZAQA==" }
     }
+  }
 }
