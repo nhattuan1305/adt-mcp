@@ -29,7 +29,7 @@ def test_rewrite_leaves_external_names_untouched():
 def test_rewrite_is_case_insensitive():
     m = build_rename_map(["ZI_FUN_MF902"], "_VN")
     out = rewrite_references("from zi_fun_mf902", m)
-    assert "zi_fun_mf902_VN" in out or "ZI_FUN_MF902_VN" in out.upper()
+    assert out == "from ZI_FUN_MF902_VN"
 
 
 def test_rewrite_longest_name_first_no_prefix_collision():
