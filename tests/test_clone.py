@@ -195,3 +195,153 @@ def test_clone_package_execute_rewrites_dependent_source():
     assert "ZI_FUN_MF902_VN" in body
     assert "from ZI_FUN_MF902 {" not in body
     assert "Clone complete" in out
+
+
+# --- SRVB binding XML used by the SRVB tests ---
+_BINDING_XML = (
+    b'<srvb:serviceBinding xmlns:srvb="x" xmlns:adtcore="y">'
+    b'<srvb:services srvb:name="ZSB_FUN">'
+    b'<srvb:content srvb:version="0001">'
+    b'<srvb:serviceDefinition adtcore:name="ZSD_FUN"/>'
+    b'</srvb:content></srvb:services>'
+    b'<srvb:binding srvb:version="V2"/>'
+    b'</srvb:serviceBinding>')
+
+
+def test_read_srvb_servicedef_parses_name_and_version():
+    def handler(req):
+        if req.method == "GET" and "bindings/" in str(req.url):
+            return httpx.Response(200, content=_BINDING_XML,
+                                  headers={"content-type": "application/xml"})
+        return httpx.Response(404, text="nf")
+
+    c = _client(handler)
+    sd = c._read_srvb_servicedef(
+        _sys(), "/sap/bc/adt/businessservices/bindings/zsb_fun")
+    assert sd == ("ZSD_FUN", "V2")
+
+
+_SRVB_NODES = (
+    b'<root xmlns:adtcore="x">'
+    b'<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>SRVB/SVB</OBJECT_TYPE>'
+    b'<OBJECT_NAME>ZSB_FUN</OBJECT_NAME>'
+    b'<OBJECT_URI>/sap/bc/adt/businessservices/bindings/zsb_fun</OBJECT_URI>'
+    b'<DESCRIPTION>binding</DESCRIPTION></SEU_ADT_REPOSITORY_OBJ_NODE>'
+    b'<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>SRVD/SRV</OBJECT_TYPE>'
+    b'<OBJECT_NAME>ZSD_FUN</OBJECT_NAME>'
+    b'<OBJECT_URI>/sap/bc/adt/ddic/srvd/sources/zsd_fun</OBJECT_URI>'
+    b'<DESCRIPTION>svcdef</DESCRIPTION></SEU_ADT_REPOSITORY_OBJ_NODE>'
+    b'</root>')
+
+
+def test_clone_package_execute_srvb_remaps_service_definition():
+    """The SRVB clone must create a binding whose service definition is the
+    _VN clone (ZSD_FUN_VN), not the original ZSD_FUN."""
+    posts = {}
+
+    def handler(req):
+        u = str(req.url)
+        if req.method == "POST" and "nodestructure" in u:
+            return httpx.Response(200, content=_SRVB_NODES,
+                                  headers={"content-type": "application/xml"})
+        if req.method == "GET" and "discovery" in u:
+            return httpx.Response(200, headers={"x-csrf-token": "T"})
+        # binding read for _read_srvb_servicedef
+        if req.method == "GET" and "businessservices/bindings/" in u:
+            return httpx.Response(200, content=_BINDING_XML,
+                                  headers={"content-type": "application/xml"})
+        # SRVD source read + create + write sequence
+        if req.method == "GET" and "srvd/sources/" in u and "/source/main" in u.lower():
+            return httpx.Response(200, text="define service ZSD_FUN { "
+                                  "expose ZI_FUN as Fun; }")
+        if req.method == "GET" and "srvd/sources/" in u and "/source/main" not in u.lower():
+            return httpx.Response(
+                200, headers={"content-type": "application/xml"},
+                content=b'<r><adtcore:packageRef xmlns:adtcore="x" '
+                        b'adtcore:name="ZRAP_FUN_MF902_VN"/></r>')
+        if req.method == "POST" and u.endswith("/ddic/srvd/sources"):
+            return httpx.Response(201, text="")
+        if req.method == "POST" and u.endswith("/businessservices/bindings"):
+            posts[u] = req.content.decode()
+            return httpx.Response(201, text="")
+        if "_action=LOCK" in u:
+            return httpx.Response(
+                200, headers={"content-type": "application/xml"},
+                content=b'<a><DATA><LOCK_HANDLE>LH</LOCK_HANDLE></DATA></a>')
+        if req.method == "PUT":
+            return httpx.Response(200, text="")
+        if "_action=UNLOCK" in u:
+            return httpx.Response(200, text="")
+        if "activation" in u:
+            return httpx.Response(200, content=b"<messages/>")
+        return httpx.Response(404, text="nf")
+
+    c = _client(handler)
+    out = c.clone_package(_sys(write_packages=["ZRAP_*"]),
+                          _sys(write_packages=["ZRAP_*"]),
+                          "ZRAP_FUN_MF902", "ZRAP_FUN_MF902_VN",
+                          suffix="_VN", dry_run=False)
+    binding_post = "\n".join(posts.values())
+    assert 'adtcore:name="ZSD_FUN_VN"' in binding_post
+    assert "Clone complete" in out
+
+
+_CLAS_NODES = (
+    b'<root xmlns:adtcore="x">'
+    b'<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>CLAS/OC</OBJECT_TYPE>'
+    b'<OBJECT_NAME>ZCL_FUN</OBJECT_NAME>'
+    b'<OBJECT_URI>/sap/bc/adt/oo/classes/zcl_fun</OBJECT_URI>'
+    b'<DESCRIPTION>helper</DESCRIPTION></SEU_ADT_REPOSITORY_OBJ_NODE>'
+    b'</root>')
+
+
+def test_clone_package_execute_clas_rewrites_includes():
+    """CLAS clone reads main + include sources, rewrites references to other
+    cloned names, and PUTs them to the new class."""
+    puts = []
+
+    def handler(req):
+        u = str(req.url)
+        if req.method == "POST" and "nodestructure" in u:
+            return httpx.Response(200, content=_CLAS_NODES,
+                                  headers={"content-type": "application/xml"})
+        if req.method == "GET" and "discovery" in u:
+            return httpx.Response(200, headers={"x-csrf-token": "T"})
+        # class main source
+        if req.method == "GET" and "classes/zcl_fun/source/main" in u.lower():
+            return httpx.Response(200, text="CLASS ZCL_FUN DEFINITION. "
+                                  "ENDCLASS. CLASS ZCL_FUN IMPLEMENTATION. ENDCLASS.")
+        # class includes (definitions/implementations/macros/testclasses)
+        if req.method == "GET" and "/includes/" in u.lower():
+            return httpx.Response(200, text="* include for ZCL_FUN")
+        # object_package read for the new class shell
+        if req.method == "GET" and "classes/" in u.lower() \
+                and "/source/main" not in u.lower() and "/includes/" not in u.lower():
+            return httpx.Response(
+                200, headers={"content-type": "application/xml"},
+                content=b'<r><adtcore:packageRef xmlns:adtcore="x" '
+                        b'adtcore:name="ZRAP_FUN_MF902_VN"/></r>')
+        if req.method == "POST" and u.endswith("/oo/classes"):
+            return httpx.Response(201, text="")
+        if "_action=LOCK" in u:
+            return httpx.Response(
+                200, headers={"content-type": "application/xml"},
+                content=b'<a><DATA><LOCK_HANDLE>LH</LOCK_HANDLE></DATA></a>')
+        if req.method == "PUT":
+            puts.append(req.content.decode())
+            return httpx.Response(200, text="")
+        if "_action=UNLOCK" in u:
+            return httpx.Response(200, text="")
+        if "activation" in u:
+            return httpx.Response(200, content=b"<messages/>")
+        return httpx.Response(404, text="nf")
+
+    c = _client(handler)
+    out = c.clone_package(_sys(write_packages=["ZRAP_*"]),
+                          _sys(write_packages=["ZRAP_*"]),
+                          "ZRAP_FUN_MF902", "ZRAP_FUN_MF902_VN",
+                          suffix="_VN", dry_run=False)
+    body = "\n".join(puts)
+    # main source rewritten to the _VN class name
+    assert "ZCL_FUN_VN" in body
+    assert "Clone complete" in out
