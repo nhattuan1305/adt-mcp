@@ -345,3 +345,29 @@ def test_clone_package_execute_clas_rewrites_includes():
     # main source rewritten to the _VN class name
     assert "ZCL_FUN_VN" in body
     assert "Clone complete" in out
+
+
+_PROG_NODES = (
+    b'<root xmlns:adtcore="x">'
+    b'<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>PROG/P</OBJECT_TYPE>'
+    b'<OBJECT_NAME>ZPROG_FUN</OBJECT_NAME>'
+    b'<OBJECT_URI>/sap/bc/adt/programs/programs/zprog_fun</OBJECT_URI>'
+    b'<DESCRIPTION>report</DESCRIPTION></SEU_ADT_REPOSITORY_OBJ_NODE>'
+    b'</root>')
+
+
+def test_clone_package_dry_run_includes_prog_without_crash():
+    """PROG is in CREATE_TYPES; the plan must include it without raising
+    (regression: PROG was missing from CLONE_ORDER -> ValueError in sort)."""
+    def handler(req):
+        u = str(req.url)
+        if req.method == "POST" and "nodestructure" in u:
+            return httpx.Response(200, content=_PROG_NODES,
+                                  headers={"content-type": "application/xml"})
+        return httpx.Response(404, text="nf")
+
+    c = _client(handler)
+    out = c.clone_package(_sys(), _sys(), "ZRAP_FUN_MF902",
+                          "ZRAP_FUN_MF902_VN", suffix="_VN", dry_run=True)
+    assert "ZPROG_FUN -> ZPROG_FUN_VN" in out
+    assert "Dry run" in out

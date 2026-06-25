@@ -71,7 +71,7 @@ def rewrite_references(source: str, rename_map: dict[str, str]) -> str:
 
 # Creation order by dependency (DOMA->...->SRVB). Activation is batched at the
 # end so order within a group (e.g. multiple DDLS) need not be perfect.
-CLONE_ORDER = ["DOMA", "DTEL", "TABL", "DDLS", "DDLX", "DCLS",
+CLONE_ORDER = ["DOMA", "DTEL", "PROG", "TABL", "DDLS", "DDLX", "DCLS",
                "INTF", "CLAS", "BDEF", "SRVD", "SRVB"]
 
 # Types that can only be created as a shell (content not copied) -> skip in v1.
@@ -2040,10 +2040,11 @@ class ADTClient:
         for o, _, _ in errors:
             rename_map.pop(o["name"].upper(), None)
 
-        cloneable.sort(key=lambda os: CLONE_ORDER.index(os[1]))
+        cloneable.sort(key=lambda os: CLONE_ORDER.index(os[1])
+                       if os[1] in CLONE_ORDER else len(CLONE_ORDER))
 
         lines = [f"Plan: clone {source_package.upper()} -> "
-                 f"{target_package.upper()} (suffix={suffix}), "
+                 f"{target_package.upper()} (suffix={suffix.upper()}), "
                  f"{len(cloneable)} clone, {len(skipped)} skip, "
                  f"{len(errors)} error"]
         for o, short in cloneable:
@@ -2130,6 +2131,8 @@ class ADTClient:
     def _read_srvb_servicedef(self, system: System,
                               uri: str) -> tuple[str, str] | None:
         """Read a binding -> (service definition name, binding version V2/V4)."""
+        if not uri:
+            return None
         url = f"{base_url(system.url)}{uri}"
         try:
             resp = self._get(system, url, "application/xml")
