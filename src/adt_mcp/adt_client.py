@@ -2098,25 +2098,50 @@ class ADTClient:
                                       binding_version=version,
                                       transport=transport)
         if short == "CLAS":
+            # A class is a global class (main) plus local includes:
+            #   definitions/implementations = local & RAP-handler classes,
+            #   macros, testclasses (CCAU = unit tests).
+            # Read every part up front so a read error aborts before we create
+            # an orphaned shell on the target.
+            main_src = self.get_source(source, "CLAS", name)
+            if main_src.startswith("Error:"):
+                return f"FAILED read class main: {main_src}"
+            includes = {}
+            for inc in ("definitions", "implementations", "macros",
+                        "testclasses"):
+                s = self.get_class_include(source, name, inc)
+                if not s.startswith("Error:") and s.strip():
+                    includes[inc] = rewrite_references(s, rename_map)
+
             shell = self.create_object(target, "CLAS", new, package, desc,
                                        transport=transport)
             if not shell.startswith("OK"):
                 return shell
+            # main FIRST: the global class establishes the inactive version that
+            # the local includes attach to. Writing a local include (e.g.
+            # testclasses/CCAU) before main fails with "does not have any
+            # inactive version".
+            w = self.update_class_include(
+                target, new, "main", rewrite_references(main_src, rename_map),
+                transport, activate=False)
+            if not w.startswith("OK"):
+                return f"FAILED include main: {w}"
+            # definitions/implementations carry local & RAP-handler classes →
+            # fatal if they fail. macros/testclasses are non-runtime → warn but
+            # keep the class so the BO isn't lost over a unit-test include.
+            warns = []
             for inc in ("definitions", "implementations", "macros",
-                        "testclasses", "main"):
-                src = (self.get_class_include(source, name, inc)
-                       if inc != "main"
-                       else self.get_source(source, "CLAS", name))
-                if src.startswith("Error:") or not src.strip():
+                        "testclasses"):
+                if inc not in includes:
                     continue
-                w = self.update_class_include(
-                    target, new, inc, rewrite_references(src, rename_map),
-                    transport, activate=False)
-                # An include failure here leaves an orphaned shell on the target
-                # (acceptable for v1; retry-safe behavior is out of scope).
+                w = self.update_class_include(target, new, inc, includes[inc],
+                                              transport, activate=False)
                 if not w.startswith("OK"):
-                    return f"FAILED include {inc}: {w}"
-            return "OK"
+                    if inc in ("definitions", "implementations"):
+                        return f"FAILED include {inc}: {w}"
+                    warns.append(f"{inc}: {w}")
+            return "OK" if not warns else \
+                "OK (include warnings: " + "; ".join(warns) + ")"
         src = self.get_source(source, short, name)
         if src.startswith("Error:"):
             return f"FAILED read source: {src}"
