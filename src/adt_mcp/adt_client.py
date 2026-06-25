@@ -566,9 +566,11 @@ def parse_revision_feed(data: bytes) -> list[dict]:
 def parse_dumps_feed(data: bytes) -> list[dict]:
     """Parse the ABAP runtime dumps (ST22) atom feed into dump dicts.
 
-    Each: {uri, title, author, date, categories} where categories is a list of
-    (term, label) pairs carrying the runtime error, program, package, etc.
-    `uri` is the dump's detail resource (atom:id, falling back to a self link).
+    Each: {uri, title, author, date, categories, summary} where categories is a
+    list of (term, label) pairs (runtime error, terminated program, …) and
+    `summary` is the full dump HTML embedded in the feed entry. `uri` is the
+    atom:id — a logical key (the atom:link hrefs are adt:// SAP GUI links, not
+    HTTP-fetchable), used to match the entry again in get_dump.
     """
     if not data:
         return []
@@ -581,7 +583,7 @@ def parse_dumps_feed(data: bytes) -> list[dict]:
         if _localname(entry.tag) != "entry":
             continue
         d = {"uri": "", "title": "", "author": "", "date": "",
-             "categories": []}
+             "categories": [], "summary": ""}
         for ch in entry:
             ln = _localname(ch.tag)
             if ln == "id":
@@ -599,11 +601,8 @@ def parse_dumps_feed(data: bytes) -> list[dict]:
                 term = attrs.get("term", "")
                 if term:
                     d["categories"].append((term, attrs.get("label", "")))
-            elif ln == "link" and not d["uri"]:
-                attrs = {_localname(k): v for k, v in ch.attrib.items()}
-                rel = attrs.get("rel", "")
-                if rel in ("self", "") and attrs.get("href"):
-                    d["uri"] = attrs["href"]
+            elif ln == "summary":
+                d["summary"] = ch.text or ""
         if d["uri"]:
             out.append(d)
     return out
@@ -616,6 +615,7 @@ def html_to_text(html: str) -> str:
     import html as _html
     text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
     text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</(td|th)\s*>", "\t", text)   # keep table cells apart
     text = re.sub(r"(?i)</(p|div|tr|h[1-6]|li|table)\s*>", "\n", text)
     text = re.sub(r"(?s)<[^>]+>", "", text)
     text = _html.unescape(text).replace("\xa0", " ")
@@ -1650,12 +1650,12 @@ class ADTClient:
 
     DUMPS_BASE = "/sap/bc/adt/runtime/dumps"
 
-    def list_dumps(self, system: System, from_date: str | None = None,
-                   to_date: str | None = None, max_dumps: int = 50) -> str:
-        """List recent ABAP runtime dumps (ST22), newest first.
+    def _fetch_dumps_feed(self, system: System, from_date: str | None,
+                          to_date: str | None) -> "list[dict] | str":
+        """GET the runtime dumps atom feed; return parsed dumps or an error str.
 
-        from_date/to_date filter the feed; pass timestamps as 'yyyyMMddHHmmss'
-        (e.g. '20260601000000'). Each line shows the dump uri for get_dump.
+        Each entry already carries the full dump in its `summary` (the
+        atom:link hrefs are adt:// SAP GUI links, not HTTP resources).
         """
         params = []
         if from_date:
@@ -1667,24 +1667,42 @@ class ADTClient:
         try:
             resp = self._get(system, url, "application/atom+xml;type=feed")
         except httpx.HTTPError as e:
-            return f"Error: dumps list request failed: {e}"
+            return f"Error: dumps feed request failed: {e}"
         if resp.status_code in (401, 403):
             return (f"Error: auth failed (HTTP {resp.status_code}) — refresh "
                     f"cookies for system {system.name!r}")
         if resp.status_code != 200:
-            return f"Error: dumps list failed (HTTP {resp.status_code})"
+            return f"Error: dumps feed failed (HTTP {resp.status_code})"
         if is_login_page(resp):
             return (f"Error: session expired for system {system.name!r} "
                     f"— refresh cookies and retry")
-        dumps = parse_dumps_feed(resp.content)
+        return parse_dumps_feed(resp.content)
+
+    @staticmethod
+    def _dump_error_term(categories: list) -> str:
+        """The ABAP runtime error term (category labelled 'runtime error')."""
+        for term, label in categories:
+            if "runtime error" in (label or "").lower():
+                return term
+        return categories[0][0] if categories else ""
+
+    def list_dumps(self, system: System, from_date: str | None = None,
+                   to_date: str | None = None, max_dumps: int = 50) -> str:
+        """List recent ABAP runtime dumps (ST22), newest first.
+
+        from_date/to_date filter the feed; pass timestamps as 'yyyyMMddHHmmss'
+        (e.g. '20260601000000'). Each line shows the dump uri for get_dump.
+        """
+        dumps = self._fetch_dumps_feed(system, from_date, to_date)
+        if isinstance(dumps, str):
+            return dumps
         if not dumps:
             return ("No runtime dumps found"
-                    + (" for that period." if qs else "."))
+                    + (" for that period." if (from_date or to_date) else "."))
         dumps.sort(key=lambda d: d["date"], reverse=True)
         lines = [f"Runtime dumps ({len(dumps)} found, newest first):"]
         for d in dumps[:max_dumps]:
-            err = next((t for t, _ in d["categories"]
-                        if t and t.upper() == t), "")
+            err = self._dump_error_term(d["categories"])
             tag = f"  [{err}]" if err else ""
             lines.append(
                 f"  {d['date']}  {d['author'] or '?':<12}{tag}  "
@@ -1692,36 +1710,39 @@ class ADTClient:
         return "\n".join(lines)
 
     def get_dump(self, system: System, dump_uri: str) -> str:
-        """Fetch one runtime dump (uri from list_dumps) as readable text.
+        """Return one runtime dump (uri from list_dumps) as readable text.
 
-        Returns the full ST22 short dump (error analysis, source extract, call
-        stack) flattened from the ADT HTML rendering for AI analysis.
+        The dump body is embedded in the feed entry's summary, so this matches
+        the entry by uri and flattens its HTML (error analysis, source extract,
+        call stack) for AI analysis — no second fetch of the adt:// link.
         """
         if not dump_uri:
             return "Error: dump_uri is required"
-        url = f"{base_url(system.url)}{dump_uri}"
-        try:
-            resp = self._get(
-                system, url,
-                "text/html, application/xhtml+xml, application/xml")
-        except httpx.HTTPError as e:
-            return f"Error: dump request failed: {e}"
-        if resp.status_code in (401, 403):
-            return (f"Error: auth failed (HTTP {resp.status_code}) — refresh "
-                    f"cookies for system {system.name!r}")
-        if resp.status_code == 404:
-            return f"Error: dump not found ({dump_uri})"
-        if resp.status_code != 200:
-            return f"Error: HTTP {resp.status_code}: {resp.text[:300]}"
-        body = resp.text
-        # The dump detail is legitimately text/html, so is_login_page() (which
-        # flags all html) can't be used — key off the SAML markers instead.
-        if "SAMLRequest" in body or "saml2/idp" in body.lower():
-            return (f"Error: session expired for system {system.name!r} "
-                    f"— refresh cookies and retry")
-        ctype = resp.headers.get("content-type", "")
-        text = html_to_text(body) if "html" in ctype else body
-        return text or "(empty dump)"
+        key = dump_uri.split("#", 1)[0].split("?", 1)[0].strip()
+        # Try the recent feed first; if the dump is older than that window,
+        # re-query bounded to its timestamp (first 14 digits of the id).
+        windows: list[tuple[str | None, str | None]] = [(None, None)]
+        m = re.search(r"/dumps/(\d{14})", key)
+        if m:
+            windows.append((m.group(1), m.group(1)))
+        last_err = None
+        for frm, to in windows:
+            dumps = self._fetch_dumps_feed(system, frm, to)
+            if isinstance(dumps, str):
+                last_err = dumps
+                continue
+            for d in dumps:
+                if d["uri"].split("#", 1)[0] == key:
+                    summary = d.get("summary", "")
+                    if not summary.strip():
+                        return ("(dump entry has no summary; error="
+                                f"{self._dump_error_term(d['categories'])})")
+                    return html_to_text(summary)
+        if last_err:
+            return last_err
+        return (f"Error: dump not found in feed ({key}). It may be outside the "
+                f"returned window — retry list_dumps with from_date/to_date "
+                f"around the dump's timestamp.")
 
     # --- API release state (ABAP Cloud / Clean Core) ---
 
