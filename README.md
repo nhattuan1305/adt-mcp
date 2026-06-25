@@ -51,6 +51,7 @@ Read / navigate:
 Write (gated by safety, see below):
 - `update_source`, `update_class_include`, `activate`
 - `create_object` (CLAS / INTF / DDLS / DDLX / BDEF / SRVD / SRVB / TABL)
+- `clone_package` (clone toàn bộ object của một package sang package đích, thêm suffix `_VN` + sửa tham chiếu chéo trong source; dry-run mặc định)
 
 Cookie maintenance: `refresh_cookies_for`.
 

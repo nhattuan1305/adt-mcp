@@ -50,6 +50,39 @@ OBJECT_PATHS = {
 # Accept aliases for object types
 OBJECT_TYPE_ALIASES = {"STRUCT": "STRU"}
 
+
+def build_rename_map(names: list[str], suffix: str) -> dict[str, str]:
+    """{ORIG_NAME.upper(): ORIG_NAME.upper()+suffix.upper()} for clone rename."""
+    suf = (suffix or "").upper()
+    return {n.upper(): n.upper() + suf for n in names}
+
+
+def rewrite_references(source: str, rename_map: dict[str, str]) -> str:
+    """Replace names from rename_map with their target, matching on word
+    boundaries, case-insensitive. Longest names first to avoid prefix
+    collisions (e.g. ZI_FUN_MF902 before ZI_FUN)."""
+    if not source or not rename_map:
+        return source
+    for old in sorted(rename_map, key=len, reverse=True):
+        source = re.sub(rf"\b{re.escape(old)}\b", rename_map[old],
+                        source, flags=re.IGNORECASE)
+    return source
+
+
+# Creation order by dependency (DOMA->...->SRVB). Activation is batched at the
+# end so order within a group (e.g. multiple DDLS) need not be perfect.
+CLONE_ORDER = ["DOMA", "DTEL", "PROG", "TABL", "DDLS", "DDLX", "DCLS",
+               "INTF", "CLAS", "BDEF", "SRVD", "SRVB"]
+
+# Types that can only be created as a shell (content not copied) -> skip in v1.
+SKIP_CLONE_TYPES = {"DTEL", "DOMA"}
+
+
+def clone_short_type(node_type: str) -> str:
+    """nodestructure OBJECT_TYPE ('DDLS/DF') -> CREATE_TYPES key ('DDLS')."""
+    return (node_type or "").split("/")[0].upper()
+
+
 CLASS_INCLUDES = {"definitions", "implementations", "macros", "testclasses"}
 
 
@@ -62,6 +95,8 @@ def object_root_path(object_type: str, name: str,
             raise ValueError("FUGR requires function_group")
         return (f"/sap/bc/adt/functions/groups/{function_group.upper()}"
                 f"/fmodules/{name.upper()}")
+    if ot == "SRVB":
+        return f"/sap/bc/adt/businessservices/bindings/{name.upper()}"
     if ot not in OBJECT_PATHS:
         raise ValueError(f"invalid object_type {object_type!r}")
     return OBJECT_PATHS[ot].format(
@@ -1807,6 +1842,39 @@ class ADTClient:
             return f"Error: activate failed (HTTP {resp.status_code}): {resp.text[:200]}"
         return parse_activation(resp.content)
 
+    def activate_many(self, system: System,
+                      refs: list[tuple[str, str, str | None]]) -> str:
+        """Activate multiple objects in ONE call so SAP resolves their
+        interdependencies. refs: list of (object_type, name, function_group)."""
+        if not refs:
+            return "OK"
+        parts = []
+        for ot, name, fg in refs:
+            try:
+                rp = object_root_path(ot, name, fg)
+            # Unknown object type is a programmer error — fail fast with a clear message.
+            except ValueError as e:
+                return f"Error: {e}"
+            parts.append(
+                f'<adtcore:objectReference adtcore:uri="{rp}" '
+                f'adtcore:name="{name.upper()}"/>')
+        body = (f'<?xml version="1.0" encoding="UTF-8"?>'
+                f'<adtcore:objectReferences '
+                f'xmlns:adtcore="http://www.sap.com/adt/core">'
+                f'{"".join(parts)}'
+                f'</adtcore:objectReferences>').encode("utf-8")
+        url = (f"{base_url(system.url)}/sap/bc/adt/activation"
+               f"?method=activate&preauditRequested=true")
+        try:
+            resp = self._post(system, url, "application/xml",
+                              body, "application/xml")
+        except httpx.HTTPError as e:
+            return f"Error: activate request failed: {e}"
+        if resp.status_code not in (200, 202):
+            return (f"Error: activate failed (HTTP {resp.status_code}): "
+                    f"{resp.text[:200]}")
+        return parse_activation(resp.content)
+
     def object_package(self, system: System, object_type: str,
                        name: str, function_group: str | None = None) -> str | None:
         try:
@@ -1934,3 +2002,156 @@ class ADTClient:
         if source and source_capable:
             return self.update_source(system, ot, name, source, transport)
         return f"OK: created {ot} {name.upper()} in {package.upper()}"
+
+    def clone_package(self, source: System, target: System,
+                      source_package: str, target_package: str,
+                      suffix: str = "_VN", dry_run: bool = True,
+                      transport: str | None = None) -> str:
+        """Clone all objects of source_package into target_package (must exist),
+        append suffix to every name, rewrite cross-references, activate at end."""
+        objs = self.list_package(source, source_package)
+        if isinstance(objs, str):
+            return objs
+        if not objs:
+            return f"(no objects in package {source_package.upper()})"
+
+        cloneable, skipped = [], []
+        for o in objs:
+            short = clone_short_type(o["type"])
+            if short == "DEVC":
+                continue
+            if short not in CREATE_TYPES:
+                skipped.append((o, short, "type không hỗ trợ create"))
+            elif short in SKIP_CLONE_TYPES:
+                skipped.append((o, short, "type chỉ tạo shell (v1)"))
+            else:
+                cloneable.append((o, short))
+
+        rename_map = build_rename_map([o["name"] for o, _ in cloneable], suffix)
+
+        errors = []
+        for o, short in list(cloneable):
+            if len(rename_map[o["name"].upper()]) > 30:
+                errors.append((o, short, "tên đích > 30 ký tự"))
+        err_names = {o["name"] for o, _, _ in errors}
+        cloneable = [(o, s) for o, s in cloneable if o["name"] not in err_names]
+        # Drop over-length objects from rename_map so cross-references are never
+        # rewritten to a non-existent (too-long) target name.
+        for o, _, _ in errors:
+            rename_map.pop(o["name"].upper(), None)
+
+        cloneable.sort(key=lambda os: CLONE_ORDER.index(os[1])
+                       if os[1] in CLONE_ORDER else len(CLONE_ORDER))
+
+        lines = [f"Plan: clone {source_package.upper()} -> "
+                 f"{target_package.upper()} (suffix={suffix.upper()}), "
+                 f"{len(cloneable)} clone, {len(skipped)} skip, "
+                 f"{len(errors)} error"]
+        for o, short in cloneable:
+            lines.append(f"  ✓  {short:<5} {o['name']} -> "
+                         f"{rename_map[o['name'].upper()]}")
+        for o, short, why in skipped + errors:
+            lines.append(f"  ⊘  {short:<5} {o['name']} -> (skip: {why})")
+
+        if dry_run:
+            lines.append("Dry run — chưa ghi gì. Đặt dry_run=false để thực thi.")
+            return "\n".join(lines)
+
+        gate = check_write(target, target_package)
+        if gate:
+            return gate
+
+        created_refs: list[tuple[str, str, str | None]] = []
+        results = []
+        ok = 0
+        for o, short in cloneable:
+            name, new = o["name"], rename_map[o["name"].upper()]
+            desc = o.get("description") or f"Clone of {name}"
+            res = self._clone_one(source, target, short, name, new,
+                                  target_package, desc, rename_map,
+                                  o.get("uri", ""), transport)
+            results.append(f"  {short} {new}: {res}")
+            if res.startswith("OK"):
+                created_refs.append((short, new, None))
+                ok += 1
+
+        act = self.activate_many(target, created_refs)
+        return ("\n".join(lines[1:]) + "\n--- Execute ---\n"
+                + "\n".join(results)
+                + f"\nActivate ({len(created_refs)} objects): {act}"
+                + f"\nClone complete: {ok} success, "
+                + f"{len(skipped)+len(errors)} skipped, "
+                + f"{len(cloneable)-ok} failed")
+
+    def _clone_one(self, source: System, target: System, short: str,
+                   name: str, new: str, package: str, desc: str,
+                   rename_map: dict[str, str], uri: str,
+                   transport: str | None) -> str:
+        if short == "SRVB":
+            sd = self._read_srvb_servicedef(source, uri)
+            if sd is None:
+                return "FAILED: không đọc được service definition của binding"
+            sd_name, version = sd
+            sd_new = rename_map.get(sd_name.upper(), sd_name.upper())
+            return self.create_object(target, "SRVB", new, package, desc,
+                                      service_definition=sd_new,
+                                      binding_version=version,
+                                      transport=transport)
+        if short == "CLAS":
+            shell = self.create_object(target, "CLAS", new, package, desc,
+                                       transport=transport)
+            if not shell.startswith("OK"):
+                return shell
+            for inc in ("definitions", "implementations", "macros",
+                        "testclasses", "main"):
+                src = (self.get_class_include(source, name, inc)
+                       if inc != "main"
+                       else self.get_source(source, "CLAS", name))
+                if src.startswith("Error:") or not src.strip():
+                    continue
+                w = self.update_class_include(
+                    target, new, inc, rewrite_references(src, rename_map),
+                    transport, activate=False)
+                # An include failure here leaves an orphaned shell on the target
+                # (acceptable for v1; retry-safe behavior is out of scope).
+                if not w.startswith("OK"):
+                    return f"FAILED include {inc}: {w}"
+            return "OK"
+        src = self.get_source(source, short, name)
+        if src.startswith("Error:"):
+            return f"FAILED read source: {src}"
+        shell = self.create_object(target, short, new, package, desc,
+                                   transport=transport)
+        if not shell.startswith("OK"):
+            return shell
+        return self.update_source(target, short, new,
+                                  rewrite_references(src, rename_map),
+                                  transport, activate=False)
+
+    def _read_srvb_servicedef(self, system: System,
+                              uri: str) -> tuple[str, str] | None:
+        """Read a binding -> (service definition name, binding version V2/V4)."""
+        if not uri:
+            return None
+        url = f"{base_url(system.url)}{uri}"
+        try:
+            resp = self._get(system, url, "application/xml")
+        except httpx.HTTPError:
+            return None
+        if resp.status_code != 200 or is_login_page(resp):
+            return None
+        try:
+            root = ET.fromstring(resp.content)
+        except ET.ParseError:
+            return None
+        sd_name, version = None, "V2"
+        for el in root.iter():
+            ln = _localname(el.tag)
+            attrs = {_localname(k): v for k, v in el.attrib.items()}
+            if ln == "serviceDefinition" and attrs.get("name"):
+                sd_name = attrs["name"]
+            if ln == "binding" and attrs.get("version"):
+                version = attrs["version"]
+        if not sd_name:
+            return None
+        return sd_name, version

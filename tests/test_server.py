@@ -68,3 +68,11 @@ def test_refresh_cookies_for_offloads_playwright_off_event_loop(tmp_path):
     assert observed.get("loop_running") is False, (
         "refresh_cookies ran inside the event loop thread — sync Playwright "
         "would crash; it must be offloaded to a worker thread")
+
+
+def test_clone_package_tool_registered(tmp_path):
+    reg = _reg(tmp_path)
+    adt = ADTClient(httpx.Client())
+    mcp = build_server(reg, adt)
+    tools = asyncio.run(mcp.list_tools())
+    assert any(t.name == "clone_package" for t in tools)
