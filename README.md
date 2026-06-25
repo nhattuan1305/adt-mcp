@@ -47,6 +47,7 @@ Read / navigate:
 - `get_revisions`, `get_revision_source`, `compare_source`
 - `syntax_check`, `run_unit_tests` (ABAP Unit), `data_preview` (CDS/SQL data)
 - `trace_start`, `trace_list`, `trace_analyze` (ABAP profiler: CPU hotspots + DB accesses)
+- `list_dumps`, `get_dump` (ST22 runtime dumps: liệt kê + đọc chi tiết để phân tích lỗi)
 
 Write (gated by safety, see below):
 - `update_source`, `update_class_include`, `activate`
