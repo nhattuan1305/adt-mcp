@@ -108,3 +108,90 @@ def test_activate_many_unknown_type_returns_error():
     out = _client(lambda r: httpx.Response(200, content=b"<messages/>")).activate_many(
         _sys(), [("NOPE", "ZX", None)])
     assert out.startswith("Error:")
+
+
+_NODES = (
+    b'<root xmlns:adtcore="x">'
+    b'<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>DDLS/DF</OBJECT_TYPE>'
+    b'<OBJECT_NAME>ZI_FUN_MF902</OBJECT_NAME>'
+    b'<OBJECT_URI>/sap/bc/adt/ddic/ddl/sources/zi_fun_mf902</OBJECT_URI>'
+    b'<DESCRIPTION>iface</DESCRIPTION></SEU_ADT_REPOSITORY_OBJ_NODE>'
+    b'<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>DDLS/DF</OBJECT_TYPE>'
+    b'<OBJECT_NAME>ZC_FUN_MF902</OBJECT_NAME>'
+    b'<OBJECT_URI>/sap/bc/adt/ddic/ddl/sources/zc_fun_mf902</OBJECT_URI>'
+    b'<DESCRIPTION>cons</DESCRIPTION></SEU_ADT_REPOSITORY_OBJ_NODE>'
+    b'<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>DOMA/DD</OBJECT_TYPE>'
+    b'<OBJECT_NAME>ZD_STATUS</OBJECT_NAME>'
+    b'<OBJECT_URI>/sap/bc/adt/ddic/domains/zd_status</OBJECT_URI>'
+    b'<DESCRIPTION>dom</DESCRIPTION></SEU_ADT_REPOSITORY_OBJ_NODE>'
+    b'</root>')
+
+
+def _nodestructure_handler(extra=None):
+    def handler(req):
+        u = str(req.url)
+        if req.method == "POST" and "nodestructure" in u:
+            return httpx.Response(200, content=_NODES,
+                                  headers={"content-type": "application/xml"})
+        if extra:
+            r = extra(req)
+            if r is not None:
+                return r
+        return httpx.Response(404, text="nf")
+    return handler
+
+
+def test_clone_package_dry_run_lists_plan_and_skips_doma():
+    c = _client(_nodestructure_handler())
+    out = c.clone_package(_sys(), _sys(), "ZRAP_FUN_MF902",
+                          "ZRAP_FUN_MF902_VN", suffix="_VN", dry_run=True)
+    assert "ZI_FUN_MF902 -> ZI_FUN_MF902_VN" in out
+    assert "ZC_FUN_MF902 -> ZC_FUN_MF902_VN" in out
+    assert "ZD_STATUS" in out and "skip" in out.lower()
+    assert "Dry run" in out
+
+
+def test_clone_package_execute_rewrites_dependent_source():
+    """ZC_FUN_MF902 reads from ZI_FUN_MF902; after clone, the ZC_..._VN source
+    sent to SAP must contain ZI_FUN_MF902_VN (points to the clone, not original)."""
+    puts = {}
+
+    def extra(req):
+        u = str(req.url)
+        if req.method == "GET" and "discovery" in u:
+            return httpx.Response(200, headers={"x-csrf-token": "T"})
+        if req.method == "GET" and "zi_fun_mf902/source/main" in u.lower():
+            return httpx.Response(200, text="define view entity ZI_FUN_MF902 "
+                                  "as select from ztab { key id }")
+        if req.method == "GET" and "zc_fun_mf902/source/main" in u.lower():
+            return httpx.Response(200, text="define view entity ZC_FUN_MF902 "
+                                  "as select from ZI_FUN_MF902 { key id }")
+        if req.method == "POST" and u.endswith("/ddic/ddl/sources"):
+            return httpx.Response(201, text="")
+        if req.method == "GET" and "ddl/sources/" in u and "/source/main" not in u:
+            return httpx.Response(
+                200, headers={"content-type": "application/xml"},
+                content=b'<r><adtcore:packageRef xmlns:adtcore="x" '
+                        b'adtcore:name="ZRAP_FUN_MF902_VN"/></r>')
+        if "_action=LOCK" in u:
+            return httpx.Response(
+                200, headers={"content-type": "application/xml"},
+                content=b'<a><DATA><LOCK_HANDLE>LH</LOCK_HANDLE></DATA></a>')
+        if req.method == "PUT":
+            puts[str(req.url)] = req.content.decode()
+            return httpx.Response(200, text="")
+        if "_action=UNLOCK" in u:
+            return httpx.Response(200, text="")
+        if "activation" in u:
+            return httpx.Response(200, content=b"<messages/>")
+        return None
+
+    c = _client(_nodestructure_handler(extra))
+    out = c.clone_package(_sys(write_packages=["ZRAP_*"]),
+                          _sys(write_packages=["ZRAP_*"]),
+                          "ZRAP_FUN_MF902", "ZRAP_FUN_MF902_VN",
+                          suffix="_VN", dry_run=False)
+    body = "\n".join(puts.values())
+    assert "ZI_FUN_MF902_VN" in body
+    assert "from ZI_FUN_MF902 {" not in body
+    assert "Clone complete" in out
