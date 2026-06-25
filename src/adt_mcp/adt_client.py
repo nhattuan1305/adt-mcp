@@ -1852,6 +1852,7 @@ class ADTClient:
         for ot, name, fg in refs:
             try:
                 rp = object_root_path(ot, name, fg)
+            # Unknown object type is a programmer error — fail fast with a clear message.
             except ValueError as e:
                 return f"Error: {e}"
             parts.append(
@@ -1871,7 +1872,7 @@ class ADTClient:
             return f"Error: activate request failed: {e}"
         if resp.status_code not in (200, 202):
             return (f"Error: activate failed (HTTP {resp.status_code}): "
-                    f"{resp.text[:300]}")
+                    f"{resp.text[:200]}")
         return parse_activation(resp.content)
 
     def object_package(self, system: System, object_type: str,

@@ -102,3 +102,9 @@ def test_activate_many_sends_all_references_in_one_post():
 def test_activate_many_empty_is_ok():
     out = _client(lambda r: httpx.Response(404)).activate_many(_sys(), [])
     assert out == "OK"
+
+
+def test_activate_many_unknown_type_returns_error():
+    out = _client(lambda r: httpx.Response(200, content=b"<messages/>")).activate_many(
+        _sys(), [("NOPE", "ZX", None)])
+    assert out.startswith("Error:")
