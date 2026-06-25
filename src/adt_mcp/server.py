@@ -310,6 +310,24 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
             return err
         return adt.trace_analyze(sys, trace_uri, top)
 
+    @tool("list_dumps")
+    def list_dumps(system: str, from_date: str = "", to_date: str = "",
+                   max_dumps: int = 50) -> str:
+        """List recent ABAP runtime dumps (ST22), newest first, with each dump's uri for get_dump. Optional from_date/to_date filter as 'yyyyMMddHHmmss' (e.g. '20260601000000')."""
+        sys, err = _resolve(system)
+        if err:
+            return err
+        return adt.list_dumps(sys, from_date or None, to_date or None,
+                              max_dumps)
+
+    @tool("get_dump")
+    def get_dump(system: str, dump_uri: str) -> str:
+        """Fetch one runtime dump (uri from list_dumps) as readable text — error analysis, source extract and call stack — for analyzing why ABAP/RAP/OData failed."""
+        sys, err = _resolve(system)
+        if err:
+            return err
+        return adt.get_dump(sys, dump_uri)
+
     @tool("pretty_print")
     def pretty_print(system: str, source: str) -> str:
         """Format ABAP source via ADT pretty printer (applies the system's keyword-case/indent settings). Returns formatted code."""
