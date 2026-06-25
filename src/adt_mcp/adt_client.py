@@ -69,6 +69,20 @@ def rewrite_references(source: str, rename_map: dict[str, str]) -> str:
     return source
 
 
+# Creation order by dependency (DOMA->...->SRVB). Activation is batched at the
+# end so order within a group (e.g. multiple DDLS) need not be perfect.
+CLONE_ORDER = ["DOMA", "DTEL", "TABL", "DDLS", "DDLX", "DCLS",
+               "INTF", "CLAS", "BDEF", "SRVD", "SRVB"]
+
+# Types that can only be created as a shell (content not copied) -> skip in v1.
+SKIP_CLONE_TYPES = {"DTEL", "DOMA"}
+
+
+def clone_short_type(node_type: str) -> str:
+    """nodestructure OBJECT_TYPE ('DDLS/DF') -> CREATE_TYPES key ('DDLS')."""
+    return (node_type or "").split("/")[0].upper()
+
+
 CLASS_INCLUDES = {"definitions", "implementations", "macros", "testclasses"}
 
 
