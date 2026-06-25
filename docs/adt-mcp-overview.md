@@ -50,7 +50,7 @@ AI agent ──MCP(streamable-http)──▶ FastMCP server ──HTTP/ADT──
 | Lịch sử | `get_revisions`, `compare_source` | diff phiên bản |
 | Chất lượng / runtime | `syntax_check`, **`run_unit_tests`**, **`data_preview`** | kiểm thử & xem dữ liệu |
 | **Hiệu năng** | **`trace_start` / `trace_list` / `trace_analyze`** | profiling vì sao chậm (CPU + DB) |
-| Ghi (có gate) | `update_source`, `update_class_include`, `create_object`, `activate` | sửa & activate, scaffold RAP |
+| Ghi (có gate) | `update_source`, `update_class_include`, `create_object`, `activate`, **`clone_package`** | sửa & activate, scaffold RAP, clone package (+suffix `_VN`, rewrite tham chiếu) |
 | Phiên | `refresh_cookies_for` | tự làm mới cookie |
 
 ## 5. Điểm kỹ thuật "ăn điểm"
