@@ -50,6 +50,25 @@ OBJECT_PATHS = {
 # Accept aliases for object types
 OBJECT_TYPE_ALIASES = {"STRUCT": "STRU"}
 
+
+def build_rename_map(names: list[str], suffix: str) -> dict[str, str]:
+    """{ORIG_NAME.upper(): ORIG_NAME.upper()+suffix.upper()} for clone rename."""
+    suf = (suffix or "").upper()
+    return {n.upper(): n.upper() + suf for n in names}
+
+
+def rewrite_references(source: str, rename_map: dict[str, str]) -> str:
+    """Replace names from rename_map with their target, matching on word
+    boundaries, case-insensitive. Longest names first to avoid prefix
+    collisions (e.g. ZI_FUN_MF902 before ZI_FUN)."""
+    if not source or not rename_map:
+        return source
+    for old in sorted(rename_map, key=len, reverse=True):
+        source = re.sub(rf"\b{re.escape(old)}\b", rename_map[old],
+                        source, flags=re.IGNORECASE)
+    return source
+
+
 CLASS_INCLUDES = {"definitions", "implementations", "macros", "testclasses"}
 
 
