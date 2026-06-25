@@ -95,6 +95,8 @@ def object_root_path(object_type: str, name: str,
             raise ValueError("FUGR requires function_group")
         return (f"/sap/bc/adt/functions/groups/{function_group.upper()}"
                 f"/fmodules/{name.upper()}")
+    if ot == "SRVB":
+        return f"/sap/bc/adt/businessservices/bindings/{name.upper()}"
     if ot not in OBJECT_PATHS:
         raise ValueError(f"invalid object_type {object_type!r}")
     return OBJECT_PATHS[ot].format(
@@ -1838,6 +1840,38 @@ class ADTClient:
             return f"Error: activate request failed: {e}"
         if resp.status_code not in (200, 202):
             return f"Error: activate failed (HTTP {resp.status_code}): {resp.text[:200]}"
+        return parse_activation(resp.content)
+
+    def activate_many(self, system: System,
+                      refs: list[tuple[str, str, str | None]]) -> str:
+        """Activate multiple objects in ONE call so SAP resolves their
+        interdependencies. refs: list of (object_type, name, function_group)."""
+        if not refs:
+            return "OK"
+        parts = []
+        for ot, name, fg in refs:
+            try:
+                rp = object_root_path(ot, name, fg)
+            except ValueError as e:
+                return f"Error: {e}"
+            parts.append(
+                f'<adtcore:objectReference adtcore:uri="{rp}" '
+                f'adtcore:name="{name.upper()}"/>')
+        body = (f'<?xml version="1.0" encoding="UTF-8"?>'
+                f'<adtcore:objectReferences '
+                f'xmlns:adtcore="http://www.sap.com/adt/core">'
+                f'{"".join(parts)}'
+                f'</adtcore:objectReferences>').encode("utf-8")
+        url = (f"{base_url(system.url)}/sap/bc/adt/activation"
+               f"?method=activate&preauditRequested=true")
+        try:
+            resp = self._post(system, url, "application/xml",
+                              body, "application/xml")
+        except httpx.HTTPError as e:
+            return f"Error: activate request failed: {e}"
+        if resp.status_code not in (200, 202):
+            return (f"Error: activate failed (HTTP {resp.status_code}): "
+                    f"{resp.text[:300]}")
         return parse_activation(resp.content)
 
     def object_package(self, system: System, object_type: str,
