@@ -57,6 +57,7 @@ CORE_TOOLS = {
     "get_source_by_uri", "get_context", "grep_package", "find_references",
     "update_source", "update_class_include", "create_object", "activate",
     "syntax_check", "run_unit_tests", "data_preview", "refresh_cookies_for",
+    "clone_package",
 }
 
 
@@ -380,6 +381,24 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
         return adt.create_object(sys, object_type, name, package, description,
                                  source, transport, service_definition,
                                  binding_version)
+
+    @tool("clone_package")
+    def clone_package(system: str, source_package: str, target_package: str,
+                      target_system: str | None = None, suffix: str = "_VN",
+                      dry_run: bool = True,
+                      transport: str | None = None) -> str:
+        """Clone mọi object của source_package sang target_package (PHẢI tồn tại sẵn),
+        thêm suffix (mặc định _VN) vào mọi tên và sửa tham chiếu chéo trong source.
+        dry_run=True (mặc định) chỉ in kế hoạch. target_system bỏ trống = cùng system.
+        Bỏ qua DTEL/DOMA (chỉ tạo shell). Cần allow_write trên system đích."""
+        src, err = _resolve(system)
+        if err:
+            return err
+        tgt, err2 = (_resolve(target_system) if target_system else (src, None))
+        if err2:
+            return err2
+        return adt.clone_package(src, tgt, source_package, target_package,
+                                 suffix, dry_run, transport)
 
     @tool("refresh_cookies_for")
     async def refresh_cookies_for(system: str) -> str:
