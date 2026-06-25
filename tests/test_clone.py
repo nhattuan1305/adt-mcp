@@ -347,6 +347,64 @@ def test_clone_package_execute_clas_rewrites_includes():
     assert "Clone complete" in out
 
 
+def test_clone_package_clas_writes_main_before_testclasses():
+    """Regression: a behavior class whose only non-empty include is testclasses
+    (CCAU) must have its global class (main) written BEFORE the testclasses
+    include — otherwise SAP rejects CCAU with 'does not have any inactive
+    version'. Asserts the PUT to /source/main precedes /includes/testclasses."""
+    put_targets = []
+
+    def handler(req):
+        u = str(req.url)
+        if req.method == "POST" and "nodestructure" in u:
+            return httpx.Response(200, content=_CLAS_NODES,
+                                  headers={"content-type": "application/xml"})
+        if req.method == "GET" and "discovery" in u:
+            return httpx.Response(200, headers={"x-csrf-token": "T"})
+        # source class global (main)
+        if req.method == "GET" and "classes/zcl_fun/source/main" in u.lower():
+            return httpx.Response(200, text="CLASS ZCL_FUN DEFINITION. ENDCLASS. "
+                                  "CLASS ZCL_FUN IMPLEMENTATION. ENDCLASS.")
+        # only testclasses has content; the other includes are empty -> 404
+        if req.method == "GET" and "/includes/testclasses" in u.lower():
+            return httpx.Response(200, text="CLASS ltc_x DEFINITION FOR TESTING.")
+        if req.method == "GET" and "/includes/" in u.lower():
+            return httpx.Response(404, text="nf")
+        # object_package read for the new class shell
+        if req.method == "GET" and "classes/" in u.lower() \
+                and "/source/main" not in u.lower() and "/includes/" not in u.lower():
+            return httpx.Response(
+                200, headers={"content-type": "application/xml"},
+                content=b'<r><adtcore:packageRef xmlns:adtcore="x" '
+                        b'adtcore:name="ZRAP_FUN_MF902_VN"/></r>')
+        if req.method == "POST" and u.endswith("/oo/classes"):
+            return httpx.Response(201, text="")
+        if "_action=LOCK" in u:
+            return httpx.Response(
+                200, headers={"content-type": "application/xml"},
+                content=b'<a><DATA><LOCK_HANDLE>LH</LOCK_HANDLE></DATA></a>')
+        if req.method == "PUT":
+            put_targets.append(str(req.url).lower())
+            return httpx.Response(200, text="")
+        if "_action=UNLOCK" in u:
+            return httpx.Response(200, text="")
+        if "activation" in u:
+            return httpx.Response(200, content=b"<messages/>")
+        return httpx.Response(404, text="nf")
+
+    c = _client(handler)
+    out = c.clone_package(_sys(write_packages=["ZRAP_*"]),
+                          _sys(write_packages=["ZRAP_*"]),
+                          "ZRAP_FUN_MF902", "ZRAP_FUN_MF902_VN",
+                          suffix="_VN", dry_run=False)
+    main_idx = next(i for i, t in enumerate(put_targets) if "/source/main" in t)
+    tc_idx = next(i for i, t in enumerate(put_targets)
+                  if "/includes/testclasses" in t)
+    assert main_idx < tc_idx, \
+        f"main must be written before testclasses; got {put_targets}"
+    assert "Clone complete" in out
+
+
 _PROG_NODES = (
     b'<root xmlns:adtcore="x">'
     b'<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>PROG/P</OBJECT_TYPE>'
