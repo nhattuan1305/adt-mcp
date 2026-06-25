@@ -64,6 +64,12 @@ metadata extension · `BDEF` RAP behavior definition · `SRVD` service definitio
 **Performance profiling** (see recipe below)
 | `trace_start(process_type[,max_executions,expires_minutes,title])` · `trace_list([max_runs])` · `trace_analyze(trace_uri[,top])` |
 
+**Runtime dumps (ST22)**
+| tool | use |
+|---|---|
+| `list_dumps([from_date,to_date,max_dumps])` | recent short dumps, newest first; dates as `yyyyMMddHHmmss`. Each line gives the dump `uri` |
+| `get_dump(dump_uri)` | full dump as readable text (error analysis + source extract + call stack) — feed it to the model to diagnose the failure |
+
 **Write** (gated — see Write safety)
 | `update_source(object_type,name,source[,transport,function_group,activate])` · `update_class_include(class_name,include,source[,transport,activate])` · `activate(object_type,name[,function_group])` · `create_object(object_type,name,package[,description,source,transport,service_definition,binding_version])` |
 
@@ -116,6 +122,13 @@ projection) → `DDLX` → `BDEF` → behavior pool `CLAS` → `SRVD` → `SRVB`
 2. Run the slow workload (Fiori/OData action, or trigger via `data_preview`).
 3. `trace_list` → pick the run's `uri` (check the DB-ms share).
 4. `trace_analyze(uri)` → top time consumers + DB access table.
+
+**Diagnose a runtime error (dump)**:
+1. `list_dumps()` (optionally `from_date`/`to_date` as `yyyyMMddHHmmss`) → find
+   the failing run, copy its `uri`.
+2. `get_dump(uri)` → read the error category, source extract and call stack.
+3. Drill into the offending code with `get_source` /
+   `get_class_method_source`; map impact with `find_references`.
 
 ## Common mistakes
 - Forgetting `system` / using a name not in `list_systems`.

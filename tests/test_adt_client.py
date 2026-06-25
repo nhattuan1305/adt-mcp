@@ -903,3 +903,103 @@ def test_trace_analyze_combines_hitlist_and_db():
     assert "26.2" in out
     assert "SADT_BADI_ACCESS" in out             # db accesses
     assert "TOBJ_CHK_CTRL_DH" in out
+
+
+from adt_mcp.adt_client import parse_dumps_feed, html_to_text
+
+DUMPS_FEED = b"""<?xml version="1.0" encoding="utf-8"?>
+<atom:feed xmlns:atom="http://www.w3.org/2005/Atom"
+ xmlns:adtcore="http://www.sap.com/adt/core">
+<atom:entry>
+<atom:id>/sap/bc/adt/runtime/dumps/20260620111213</atom:id>
+<atom:title>UNCAUGHT_EXCEPTION CX_SY_ZERODIVIDE</atom:title>
+<atom:author><atom:name>CB99</atom:name></atom:author>
+<atom:updated>2026-06-20T11:12:13Z</atom:updated>
+<atom:category term="UNCAUGHT_EXCEPTION" label="Runtime Error"/>
+<atom:category term="ZCL_ORDER============CP" label="Program"/>
+</atom:entry>
+<atom:entry>
+<atom:id>/sap/bc/adt/runtime/dumps/20260619080000</atom:id>
+<atom:title>CONVT_NO_NUMBER</atom:title>
+<atom:author><atom:name>MILLER</atom:name></atom:author>
+<atom:published>2026-06-19T08:00:00Z</atom:published>
+<atom:category term="CONVT_NO_NUMBER" label="Runtime Error"/>
+</atom:entry>
+</atom:feed>"""
+
+
+def test_parse_dumps_feed():
+    dumps = parse_dumps_feed(DUMPS_FEED)
+    assert len(dumps) == 2
+    d = dumps[0]
+    assert d["uri"] == "/sap/bc/adt/runtime/dumps/20260620111213"
+    assert d["title"] == "UNCAUGHT_EXCEPTION CX_SY_ZERODIVIDE"
+    assert d["author"] == "CB99"
+    assert d["date"] == "2026-06-20T11:12:13Z"
+    assert ("UNCAUGHT_EXCEPTION", "Runtime Error") in d["categories"]
+
+
+def test_parse_dumps_feed_empty():
+    assert parse_dumps_feed(b"") == []
+    assert parse_dumps_feed(b"<not xml") == []
+
+
+def test_list_dumps_newest_first_and_uri():
+    seen = {}
+
+    def handler(req):
+        seen["url"] = str(req.url)
+        seen["accept"] = req.headers.get("accept", "")
+        return httpx.Response(200, content=DUMPS_FEED,
+                              headers={"content-type": "application/atom+xml"})
+
+    out = _client(handler).list_dumps(_sys())
+    assert "type=feed" in seen["accept"]
+    assert "/sap/bc/adt/runtime/dumps" in seen["url"]
+    assert out.index("20260620111213") < out.index("20260619080000")
+    assert "CB99" in out and "UNCAUGHT_EXCEPTION" in out
+
+
+def test_list_dumps_date_filter_passed():
+    seen = {}
+    _client(lambda r: seen.update(url=str(r.url)) or httpx.Response(
+        200, content=DUMPS_FEED)).list_dumps(
+        _sys(), from_date="20260601000000", to_date="20260625000000")
+    assert "from=20260601000000" in seen["url"]
+    assert "to=20260625000000" in seen["url"]
+
+
+def test_list_dumps_empty():
+    out = _client(lambda r: httpx.Response(
+        200, content=b'<atom:feed xmlns:atom="http://www.w3.org/2005/Atom"/>'
+        )).list_dumps(_sys())
+    assert "No runtime dumps" in out
+
+
+def test_get_dump_html_to_text():
+    html = (b"<html><head><style>x{}</style></head><body>"
+            b"<h1>Runtime Error</h1><p>UNCAUGHT_EXCEPTION</p>"
+            b"<table><tr><td>Line</td><td>42</td></tr></table>"
+            b"Division&nbsp;by&nbsp;zero</body></html>")
+
+    def handler(req):
+        assert "html" in req.headers.get("accept", "")
+        return httpx.Response(200, content=html,
+                              headers={"content-type": "text/html"})
+
+    out = _client(handler).get_dump(_sys(), "/sap/bc/adt/runtime/dumps/1")
+    assert "Runtime Error" in out
+    assert "UNCAUGHT_EXCEPTION" in out
+    assert "<" not in out                     # tags stripped
+    assert "Division by zero" in out          # &nbsp; unescaped
+
+
+def test_get_dump_requires_uri():
+    assert "required" in _client(
+        lambda r: httpx.Response(200)).get_dump(_sys(), "")
+
+
+def test_get_dump_404():
+    out = _client(lambda r: httpx.Response(404)).get_dump(
+        _sys(), "/sap/bc/adt/runtime/dumps/missing")
+    assert "not found" in out

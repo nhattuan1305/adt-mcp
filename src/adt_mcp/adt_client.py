@@ -563,6 +563,75 @@ def parse_revision_feed(data: bytes) -> list[dict]:
     return out
 
 
+def parse_dumps_feed(data: bytes) -> list[dict]:
+    """Parse the ABAP runtime dumps (ST22) atom feed into dump dicts.
+
+    Each: {uri, title, author, date, categories} where categories is a list of
+    (term, label) pairs carrying the runtime error, program, package, etc.
+    `uri` is the dump's detail resource (atom:id, falling back to a self link).
+    """
+    if not data:
+        return []
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return []
+    out = []
+    for entry in root.iter():
+        if _localname(entry.tag) != "entry":
+            continue
+        d = {"uri": "", "title": "", "author": "", "date": "",
+             "categories": []}
+        for ch in entry:
+            ln = _localname(ch.tag)
+            if ln == "id":
+                d["uri"] = (ch.text or "").strip()
+            elif ln == "title" and not d["title"]:
+                d["title"] = (ch.text or "").strip()
+            elif ln in ("updated", "published") and not d["date"]:
+                d["date"] = (ch.text or "").strip()
+            elif ln == "author":
+                for a in ch:
+                    if _localname(a.tag) == "name":
+                        d["author"] = (a.text or "").strip()
+            elif ln == "category":
+                attrs = {_localname(k): v for k, v in ch.attrib.items()}
+                term = attrs.get("term", "")
+                if term:
+                    d["categories"].append((term, attrs.get("label", "")))
+            elif ln == "link" and not d["uri"]:
+                attrs = {_localname(k): v for k, v in ch.attrib.items()}
+                rel = attrs.get("rel", "")
+                if rel in ("self", "") and attrs.get("href"):
+                    d["uri"] = attrs["href"]
+        if d["uri"]:
+            out.append(d)
+    return out
+
+
+def html_to_text(html: str) -> str:
+    """Flatten an ADT dump HTML page to readable plain text for analysis."""
+    if not html:
+        return ""
+    import html as _html
+    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</(p|div|tr|h[1-6]|li|table)\s*>", "\n", text)
+    text = re.sub(r"(?s)<[^>]+>", "", text)
+    text = _html.unescape(text).replace("\xa0", " ")
+    lines, blank = [], False
+    for ln in text.splitlines():
+        ln = ln.rstrip()
+        if not ln.strip():
+            if not blank:
+                lines.append("")
+            blank = True
+        else:
+            lines.append(ln)
+            blank = False
+    return "\n".join(lines).strip()
+
+
 REVISION_PATHS = {
     "PROG": "/sap/bc/adt/programs/programs/{name}/source/main/versions",
     "INTF": "/sap/bc/adt/oo/interfaces/{name}/includes/main/versions",
@@ -1576,6 +1645,83 @@ class ADTClient:
                     f"{a['total_count']:>6} {a['buffered_count']:>6} "
                     f"{a['db_time']/1000:8.1f} {a['ratio']:5.1f}%")
         return "\n".join(out)
+
+    # --- Runtime dumps (ST22 short dumps) ---
+
+    DUMPS_BASE = "/sap/bc/adt/runtime/dumps"
+
+    def list_dumps(self, system: System, from_date: str | None = None,
+                   to_date: str | None = None, max_dumps: int = 50) -> str:
+        """List recent ABAP runtime dumps (ST22), newest first.
+
+        from_date/to_date filter the feed; pass timestamps as 'yyyyMMddHHmmss'
+        (e.g. '20260601000000'). Each line shows the dump uri for get_dump.
+        """
+        params = []
+        if from_date:
+            params.append(f"from={quote(from_date)}")
+        if to_date:
+            params.append(f"to={quote(to_date)}")
+        qs = ("?" + "&".join(params)) if params else ""
+        url = f"{base_url(system.url)}{self.DUMPS_BASE}{qs}"
+        try:
+            resp = self._get(system, url, "application/atom+xml;type=feed")
+        except httpx.HTTPError as e:
+            return f"Error: dumps list request failed: {e}"
+        if resp.status_code in (401, 403):
+            return (f"Error: auth failed (HTTP {resp.status_code}) — refresh "
+                    f"cookies for system {system.name!r}")
+        if resp.status_code != 200:
+            return f"Error: dumps list failed (HTTP {resp.status_code})"
+        if is_login_page(resp):
+            return (f"Error: session expired for system {system.name!r} "
+                    f"— refresh cookies and retry")
+        dumps = parse_dumps_feed(resp.content)
+        if not dumps:
+            return ("No runtime dumps found"
+                    + (" for that period." if qs else "."))
+        dumps.sort(key=lambda d: d["date"], reverse=True)
+        lines = [f"Runtime dumps ({len(dumps)} found, newest first):"]
+        for d in dumps[:max_dumps]:
+            err = next((t for t, _ in d["categories"]
+                        if t and t.upper() == t), "")
+            tag = f"  [{err}]" if err else ""
+            lines.append(
+                f"  {d['date']}  {d['author'] or '?':<12}{tag}  "
+                f"{d['title']}\n      {d['uri']}")
+        return "\n".join(lines)
+
+    def get_dump(self, system: System, dump_uri: str) -> str:
+        """Fetch one runtime dump (uri from list_dumps) as readable text.
+
+        Returns the full ST22 short dump (error analysis, source extract, call
+        stack) flattened from the ADT HTML rendering for AI analysis.
+        """
+        if not dump_uri:
+            return "Error: dump_uri is required"
+        url = f"{base_url(system.url)}{dump_uri}"
+        try:
+            resp = self._get(
+                system, url,
+                "text/html, application/xhtml+xml, application/xml")
+        except httpx.HTTPError as e:
+            return f"Error: dump request failed: {e}"
+        if resp.status_code in (401, 403):
+            return (f"Error: auth failed (HTTP {resp.status_code}) — refresh "
+                    f"cookies for system {system.name!r}")
+        if resp.status_code == 404:
+            return f"Error: dump not found ({dump_uri})"
+        if resp.status_code != 200:
+            return f"Error: HTTP {resp.status_code}: {resp.text[:300]}"
+        body = resp.text
+        # The dump detail is legitimately text/html, so is_login_page() (which
+        # flags all html) can't be used — key off the SAML markers instead.
+        if "SAMLRequest" in body or "saml2/idp" in body.lower():
+            return (f"Error: session expired for system {system.name!r} "
+                    f"— refresh cookies and retry")
+        ctype = resp.headers.get("content-type", "")
+        text = html_to_text(body) if "html" in ctype else body
+        return text or "(empty dump)"
 
     # --- API release state (ABAP Cloud / Clean Core) ---
 
