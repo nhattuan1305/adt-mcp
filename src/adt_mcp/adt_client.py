@@ -2035,6 +2035,10 @@ class ADTClient:
                 errors.append((o, short, "tên đích > 30 ký tự"))
         err_names = {o["name"] for o, _, _ in errors}
         cloneable = [(o, s) for o, s in cloneable if o["name"] not in err_names]
+        # Drop over-length objects from rename_map so cross-references are never
+        # rewritten to a non-existent (too-long) target name.
+        for o, _, _ in errors:
+            rename_map.pop(o["name"].upper(), None)
 
         cloneable.sort(key=lambda os: CLONE_ORDER.index(os[1]))
 
@@ -2058,6 +2062,7 @@ class ADTClient:
 
         created_refs: list[tuple[str, str, str | None]] = []
         results = []
+        ok = 0
         for o, short in cloneable:
             name, new = o["name"], rename_map[o["name"].upper()]
             desc = o.get("description") or f"Clone of {name}"
@@ -2067,9 +2072,9 @@ class ADTClient:
             results.append(f"  {short} {new}: {res}")
             if res.startswith("OK"):
                 created_refs.append((short, new, None))
+                ok += 1
 
         act = self.activate_many(target, created_refs)
-        ok = sum(1 for r in results if ": OK" in r)
         return ("\n".join(lines[1:]) + "\n--- Execute ---\n"
                 + "\n".join(results)
                 + f"\nActivate ({len(created_refs)} objects): {act}"
@@ -2106,6 +2111,8 @@ class ADTClient:
                 w = self.update_class_include(
                     target, new, inc, rewrite_references(src, rename_map),
                     transport, activate=False)
+                # An include failure here leaves an orphaned shell on the target
+                # (acceptable for v1; retry-safe behavior is out of scope).
                 if not w.startswith("OK"):
                     return f"FAILED include {inc}: {w}"
             return "OK"
