@@ -28,7 +28,7 @@ hạ tầng cần thiết: `list_package`, `get_source`, `get_class_include`,
 | Hệ thống | Hỗ trợ **cả** cùng-system và cross-system (tham số `target_system` tùy chọn). |
 | Đổi tên | Thêm **suffix** (mặc định `_VN`) vào mọi object. |
 | Package đích | **Phải tồn tại sẵn**. Tool KHÔNG tạo package. |
-| Loại object | Toàn bộ bộ RAP mà `create_object` hỗ trợ, xử lý theo thứ tự phụ thuộc. |
+| Loại object | Toàn bộ bộ RAP. SRVB clone qua xử lý riêng (mục 8). DTEL/DOMA skip (v1). |
 | Mô hình chạy | Một tham số `dry_run` (mặc định `True` = chỉ xem kế hoạch). |
 | Activate | Tạo hết (inactive) → **mass-activate ở cuối**. |
 | Subpackage | **Không** đệ quy — chỉ object trực tiếp trong package nguồn (v1). |
@@ -98,6 +98,8 @@ Clone complete: 4 success, 1 skipped, 0 failed
      c. create_object(target_system, type, tên_đích, target_package, desc,
         source=rewritten, activate=False)   # tạo inactive
         - CLAS: create shell rồi ghi từng include qua update_class_include(activate=False).
+        - SRVB: không ghi source; đọc binding gốc lấy service_definition + binding
+          version, map SD qua rename_map, create_object(SRVB, ..., service_definition=...).
 9. Mass-activate tất cả object đích vừa tạo trong MỘT call (mục 7).
 10. Tổng hợp kết quả trả về.
 ```
@@ -156,10 +158,17 @@ tự giải quyết thứ tự kích hoạt giữa các object phụ thuộc.
 
 ## 8. Xử lý lỗi & giới hạn đã biết
 
-- **Type không tạo được source** (`DTEL`, `DOMA`, `SRVB` có `source_capable=False`
-  trong `CREATE_TYPES`): v1 đánh dấu **skip** và liệt kê rõ trong kết quả (chỉ tạo
-  được shell, không copy được thuộc tính domain/data element). Nếu sau này cần,
-  mở rộng riêng — ngoài phạm vi v1.
+- **SRVB (service binding)** — **CÓ clone** dù `source_capable=False`. SRVB không
+  phải dạng source nhưng `create_object` tạo được khi truyền `service_definition`.
+  Xử lý riêng: đọc binding gốc (GET object SRVB) để lấy (a) tên service definition
+  được bind, (b) loại/phiên bản binding (ODATA V2/V4 → `binding_version`). Map tên
+  service definition qua `rename_map` (vd `ZUI_FUN_MF902` → `ZUI_FUN_MF902_VN`) rồi
+  gọi `create_object(SRVB, tên_đích, ..., service_definition=SD_đích,
+  binding_version=...)`. Binding sau khi tạo trỏ vào SRVD`_VN`. Lưu ý: SRVB không
+  có "source" để ghi, nên bỏ qua bước rewrite/ghi source — chỉ create.
+- **Type không tạo được nội dung** (`DTEL`, `DOMA` có `source_capable=False`): v1
+  đánh dấu **skip** và liệt kê rõ trong kết quả (chỉ tạo được shell, không copy được
+  thuộc tính domain/data element). Ngoài phạm vi v1.
 - **Tên đích > 30 ký tự** sau khi thêm suffix: báo `error` cho object đó trong kế
   hoạch, không tạo.
 - **Object đích đã tồn tại**: create trả lỗi -> ghi nhận `FAILED`, tiếp tục object
@@ -183,8 +192,10 @@ Thêm test trong [tests/](../../../tests/) (theo phong cách `test_write.py`,
 4. **Thứ tự type**: assert thứ tự create theo mục 6.
 5. **dry_run=True**: không gọi create/activate, chỉ trả kế hoạch.
 6. **Mass activate**: `activate_many` build đúng số reference trong 1 body.
-7. **Skip type**: DOMA/DTEL/SRVB xuất hiện ở plan với trạng thái skip.
-8. **Tool registration**: `clone_package` có trong server và trong `CORE_TOOLS`.
+7. **Skip type**: DOMA/DTEL xuất hiện ở plan với trạng thái skip.
+8. **SRVB**: binding gốc trỏ SD `ZUI_FUN_MF902` → bản clone gọi create_object với
+   `service_definition=ZUI_FUN_MF902_VN`, đúng `binding_version`.
+9. **Tool registration**: `clone_package` có trong server và trong `CORE_TOOLS`.
 
 ## 10. Các đơn vị thay đổi
 
