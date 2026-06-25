@@ -38,3 +38,20 @@ def test_rewrite_longest_name_first_no_prefix_collision():
     assert "ZI_FUN_MF902_VN" in out
     assert "ZI_FUN_VN c" in out
     assert "ZI_FUN_MF902_VN_VN" not in out
+
+
+from adt_mcp.adt_client import clone_short_type, CLONE_ORDER, SKIP_CLONE_TYPES
+
+
+def test_clone_short_type_strips_subtype():
+    assert clone_short_type("DDLS/DF") == "DDLS"
+    assert clone_short_type("CLAS/OC") == "CLAS"
+    assert clone_short_type("srvb/svb") == "SRVB"
+
+
+def test_clone_order_and_skip_sets():
+    # TABL must come before DDLS; SRVD before SRVB.
+    assert CLONE_ORDER.index("TABL") < CLONE_ORDER.index("DDLS")
+    assert CLONE_ORDER.index("SRVD") < CLONE_ORDER.index("SRVB")
+    assert "DTEL" in SKIP_CLONE_TYPES and "DOMA" in SKIP_CLONE_TYPES
+    assert "SRVB" not in SKIP_CLONE_TYPES        # SRVB is cloned
