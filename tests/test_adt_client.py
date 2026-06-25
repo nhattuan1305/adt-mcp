@@ -907,36 +907,45 @@ def test_trace_analyze_combines_hitlist_and_db():
 
 from adt_mcp.adt_client import parse_dumps_feed, html_to_text
 
-DUMPS_FEED = b"""<?xml version="1.0" encoding="utf-8"?>
-<atom:feed xmlns:atom="http://www.w3.org/2005/Atom"
- xmlns:adtcore="http://www.sap.com/adt/core">
+# Mirrors the real S/4 Public Cloud feed: atom:id is a logical 'vit' key, the
+# atom:link hrefs are adt:// SAP GUI links (not HTTP), and the full dump HTML is
+# embedded (escaped) in atom:summary.
+_DUMP_ID = ("/sap/bc/adt/vit/runtime/dumps/20260620111213host_NWF_00"
+            "%20%20%20CB99%2089")
+DUMPS_FEED = ("""<?xml version="1.0" encoding="utf-8"?>
+<atom:feed xmlns:atom="http://www.w3.org/2005/Atom">
 <atom:entry>
-<atom:id>/sap/bc/adt/runtime/dumps/20260620111213</atom:id>
-<atom:title>UNCAUGHT_EXCEPTION CX_SY_ZERODIVIDE</atom:title>
 <atom:author><atom:name>CB99</atom:name></atom:author>
+<atom:category term="UNCAUGHT_EXCEPTION" label="ABAP runtime error"/>
+<atom:category term="ZCL_ORDER============CP" label="Terminated ABAP program"/>
+<atom:id>""" + _DUMP_ID + """</atom:id>
+<atom:link href="adt://NWF/sap/bc/adt/vit/runtime/dumps/x" rel="alternate" type="application/vnd.sap.adt.sapgui"/>
+<atom:link href="adt://NWF/sap/bc/adt/runtime/dump/x" rel="self" type="text/plain"/>
+<atom:summary type="html">&lt;h4&gt;Error analysis&lt;/h4&gt;Division&amp;nbsp;by&amp;nbsp;zero&lt;br&gt;CX_SY_ZERODIVIDE&lt;table&gt;&lt;tr&gt;&lt;td&gt;POST&lt;/td&gt;&lt;td&gt;42&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;</atom:summary>
+<atom:title>The exception CX_SY_ZERODIVIDE was raised.</atom:title>
 <atom:updated>2026-06-20T11:12:13Z</atom:updated>
-<atom:category term="UNCAUGHT_EXCEPTION" label="Runtime Error"/>
-<atom:category term="ZCL_ORDER============CP" label="Program"/>
 </atom:entry>
 <atom:entry>
-<atom:id>/sap/bc/adt/runtime/dumps/20260619080000</atom:id>
-<atom:title>CONVT_NO_NUMBER</atom:title>
 <atom:author><atom:name>MILLER</atom:name></atom:author>
+<atom:category term="CONVT_NO_NUMBER" label="ABAP runtime error"/>
+<atom:id>/sap/bc/adt/vit/runtime/dumps/20260619080000host_NWF_00</atom:id>
+<atom:summary type="html">&lt;p&gt;not a number&lt;/p&gt;</atom:summary>
+<atom:title>CONVT_NO_NUMBER</atom:title>
 <atom:published>2026-06-19T08:00:00Z</atom:published>
-<atom:category term="CONVT_NO_NUMBER" label="Runtime Error"/>
 </atom:entry>
-</atom:feed>"""
+</atom:feed>""").encode()
 
 
 def test_parse_dumps_feed():
     dumps = parse_dumps_feed(DUMPS_FEED)
     assert len(dumps) == 2
     d = dumps[0]
-    assert d["uri"] == "/sap/bc/adt/runtime/dumps/20260620111213"
-    assert d["title"] == "UNCAUGHT_EXCEPTION CX_SY_ZERODIVIDE"
+    assert d["uri"] == _DUMP_ID
+    assert d["title"] == "The exception CX_SY_ZERODIVIDE was raised."
     assert d["author"] == "CB99"
     assert d["date"] == "2026-06-20T11:12:13Z"
-    assert ("UNCAUGHT_EXCEPTION", "Runtime Error") in d["categories"]
+    assert ("UNCAUGHT_EXCEPTION", "ABAP runtime error") in d["categories"]
+    assert "Error analysis" in d["summary"]      # full dump embedded in feed
 
 
 def test_parse_dumps_feed_empty():
@@ -944,7 +953,7 @@ def test_parse_dumps_feed_empty():
     assert parse_dumps_feed(b"<not xml") == []
 
 
-def test_list_dumps_newest_first_and_uri():
+def test_list_dumps_newest_first_and_error_term():
     seen = {}
 
     def handler(req):
@@ -957,7 +966,8 @@ def test_list_dumps_newest_first_and_uri():
     assert "type=feed" in seen["accept"]
     assert "/sap/bc/adt/runtime/dumps" in seen["url"]
     assert out.index("20260620111213") < out.index("20260619080000")
-    assert "CB99" in out and "UNCAUGHT_EXCEPTION" in out
+    # error term comes from the 'ABAP runtime error' category, not the program
+    assert "[UNCAUGHT_EXCEPTION]" in out and "CB99" in out
 
 
 def test_list_dumps_date_filter_passed():
@@ -976,22 +986,26 @@ def test_list_dumps_empty():
     assert "No runtime dumps" in out
 
 
-def test_get_dump_html_to_text():
-    html = (b"<html><head><style>x{}</style></head><body>"
-            b"<h1>Runtime Error</h1><p>UNCAUGHT_EXCEPTION</p>"
-            b"<table><tr><td>Line</td><td>42</td></tr></table>"
-            b"Division&nbsp;by&nbsp;zero</body></html>")
-
+def test_get_dump_resolves_summary_from_feed():
+    # get_dump matches the entry by id and flattens its summary — no second
+    # fetch of the (adt://, non-HTTP) detail link.
     def handler(req):
-        assert "html" in req.headers.get("accept", "")
-        return httpx.Response(200, content=html,
-                              headers={"content-type": "text/html"})
+        assert "type=feed" in req.headers.get("accept", "")  # hits the feed
+        return httpx.Response(200, content=DUMPS_FEED,
+                              headers={"content-type": "application/atom+xml"})
 
-    out = _client(handler).get_dump(_sys(), "/sap/bc/adt/runtime/dumps/1")
-    assert "Runtime Error" in out
-    assert "UNCAUGHT_EXCEPTION" in out
+    out = _client(handler).get_dump(_sys(), _DUMP_ID)
+    assert "Error analysis" in out
+    assert "CX_SY_ZERODIVIDE" in out
+    assert "Division by zero" in out          # &nbsp; normalised
+    assert "POST\t42" in out                  # table cells kept apart
     assert "<" not in out                     # tags stripped
-    assert "Division by zero" in out          # &nbsp; unescaped
+
+
+def test_get_dump_accepts_uri_with_fragment():
+    out = _client(lambda r: httpx.Response(200, content=DUMPS_FEED)).get_dump(
+        _sys(), _DUMP_ID + "#/source/main")
+    assert "CX_SY_ZERODIVIDE" in out          # fragment stripped before match
 
 
 def test_get_dump_requires_uri():
@@ -999,7 +1013,15 @@ def test_get_dump_requires_uri():
         lambda r: httpx.Response(200)).get_dump(_sys(), "")
 
 
-def test_get_dump_404():
-    out = _client(lambda r: httpx.Response(404)).get_dump(
-        _sys(), "/sap/bc/adt/runtime/dumps/missing")
-    assert "not found" in out
+def test_get_dump_not_found_in_feed():
+    out = _client(lambda r: httpx.Response(200, content=DUMPS_FEED)).get_dump(
+        _sys(), "/sap/bc/adt/vit/runtime/dumps/99999999999999nope")
+    assert "not found in feed" in out
+
+
+def test_html_to_text_basics():
+    out = html_to_text(
+        "<style>x{}</style><h1>T</h1><p>a&nbsp;b</p>"
+        "<table><tr><td>x</td><td>y</td></tr></table>")
+    assert "T" in out and "a b" in out and "x\ty" in out
+    assert "<" not in out
