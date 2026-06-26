@@ -426,14 +426,22 @@ def parse_release_state(data: bytes) -> dict:
                  "cloud": a.get("useInSAPCloudPlatform", "") == "true",
                  "keyUser": a.get("useInKeyUserApps", "") == "true",
                  "successors": []}
-            for ch in el.iter():
+            # Read only the contract's own <status> (a direct child). The
+            # nested <stateTransitions> lists the *allowed next* states as more
+            # <status> elements (e.g. RELEASED, NOT_RELEASED); descending into
+            # them with el.iter() would overwrite the real state with the last
+            # transition option — making a RELEASED API look NOT_RELEASED.
+            for ch in el:
                 cln = _localname(ch.tag)
                 ca = {_localname(k): v for k, v in ch.attrib.items()}
-                if cln == "status":
+                if cln == "status" and not c["state"]:
                     c["state"] = ca.get("state", "")
                     c["stateDescription"] = ca.get("stateDescription", "")
-                elif cln == "successor" and ca.get("name"):
-                    c["successors"].append(ca["name"])
+                elif cln in ("successor", "successors"):
+                    for s in ch.iter():
+                        sa = {_localname(k): v for k, v in s.attrib.items()}
+                        if _localname(s.tag) == "successor" and sa.get("name"):
+                            c["successors"].append(sa["name"])
             out["contracts"].append(c)
         elif ln == "apiCatalogData":
             out["anyContractReleased"] = \

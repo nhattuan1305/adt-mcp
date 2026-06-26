@@ -519,6 +519,36 @@ def test_parse_release_state_empty():
     assert parse_release_state(b"")["contracts"] == []
 
 
+def test_parse_release_state_ignores_state_transitions():
+    # Real ABAP Cloud apirelease.v10 shape (e.g. BDEF I_SALESORDERTP): a
+    # contract carries its own <status> AND a <stateTransitions> block listing
+    # the allowed *next* states as further <status> elements. The parser must
+    # read only the contract's own status, not the last transition option.
+    xml = (b'<ars:apiRelease xmlns:ars="http://www.sap.com/adt/ars">'
+           b'<ars:releasableObject xmlns:adtcore="http://www.sap.com/adt/core"'
+           b' adtcore:type="BDEF/BDO" adtcore:name="I_SALESORDERTP"/>'
+           b'<ars:behaviour ars:create="false">'
+           b'<ars:c0Release ars:read="true"'
+           b' ars:useInSAPCloudPlatformDefault="true"/>'
+           b'</ars:behaviour>'
+           b'<ars:c0Release ars:contract="C0" ars:useInSAPCloudPlatform="true"'
+           b' ars:useInKeyUserApps="false">'
+           b'<ars:status ars:state="RELEASED" ars:stateDescription="Released"/>'
+           b'<ars:stateTransitions>'
+           b'<ars:status ars:state="RELEASED" ars:stateDescription="Released"/>'
+           b'<ars:status ars:state="NOT_RELEASED"'
+           b' ars:stateDescription="Not Released"/>'
+           b'</ars:stateTransitions>'
+           b'</ars:c0Release></ars:apiRelease>')
+    st = parse_release_state(xml)
+    contracts = [c for c in st["contracts"] if c["state"]]
+    assert len(contracts) == 1
+    assert contracts[0]["contract"] == "C0"
+    assert contracts[0]["state"] == "RELEASED"
+    assert contracts[0]["cloud"] is True
+    assert contracts[0]["keyUser"] is False
+
+
 # --- v2 Phase 6: context compression ---
 from adt_mcp.adt_client import compress_source
 
