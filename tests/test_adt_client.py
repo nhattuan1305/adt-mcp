@@ -141,6 +141,38 @@ def test_test_connection_real_ok_not_flagged():
     assert _client(handler).test_connection(_sys()) == "OK"
 
 
+def test_check_connections_reports_status_and_user():
+    def handler(req):
+        if req.url.path == "/sap/bc/adt/discovery":
+            return httpx.Response(
+                200, headers={"content-type": "application/atomsvc+xml"},
+                text="<app:service/>")
+        return httpx.Response(401)
+    client = _client(handler)
+    ok = _sys(name="dev", username="DEVUSER")
+    bad = _sys(name="qas", auth="cookie", username=None,
+               cookie_string="SAP_SESSIONID=x", password=None)
+
+    def bad_handler(req):
+        return httpx.Response(403)
+    # ok system connects; build a second client that always fails
+    rows = client.check_connections([ok])
+    assert rows == [{
+        "name": "dev", "url": "https://h.example", "client": "080",
+        "auth": "basic", "user": "DEVUSER", "status": "OK",
+        "connected": True,
+    }]
+
+    fail_rows = _client(lambda r: httpx.Response(403)).check_connections([bad])
+    assert fail_rows[0]["connected"] is False
+    assert fail_rows[0]["user"] == "(cookie session)"
+    assert "403" in fail_rows[0]["status"]
+
+
+def test_check_connections_empty():
+    assert _client(lambda r: httpx.Response(200)).check_connections([]) == []
+
+
 def test_base_url_strips_path_and_fragment():
     from adt_mcp.adt_client import base_url
     assert base_url("https://h.example/ui#Shell-home") == "https://h.example"
