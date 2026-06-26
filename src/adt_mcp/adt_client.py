@@ -1057,6 +1057,35 @@ class ADTClient:
             return f"Error: auth failed (HTTP {resp.status_code})"
         return f"Error: HTTP {resp.status_code}"
 
+    def check_connections(self, systems: list[System]) -> list[dict]:
+        """Probe every system the way the web 'Test' action does.
+
+        Runs the same /sap/bc/adt/discovery check as test_connection per
+        system (concurrently) and returns one dict each:
+        {name, url, client, auth, user, status, connected}. `user` is the
+        user the connection authenticates as — the configured username for
+        basic auth, or the stored login for cookie auth when available.
+        """
+        if not systems:
+            return []
+
+        def probe(s: System) -> dict:
+            status = self.test_connection(s)
+            return {
+                "name": s.name,
+                "url": base_url(s.url),
+                "client": s.client,
+                "auth": s.auth,
+                "user": s.username
+                        or ("(cookie session)" if s.auth == "cookie" else ""),
+                "status": status,
+                "connected": status == "OK",
+            }
+
+        workers = min(8, len(systems))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            return list(ex.map(probe, systems))
+
     # --- Navigation / discovery (v2 Phase 1) ---
 
     def get_source_by_uri(self, system: System, uri: str) -> str:
