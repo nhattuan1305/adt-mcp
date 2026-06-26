@@ -25,6 +25,20 @@ def format_systems(systems: list[System]) -> str:
     return "\n".join(lines)
 
 
+def format_connections(rows: list[dict]) -> str:
+    if not rows:
+        return "No systems configured. Open the web admin to add one."
+    lines = ["System connections:"]
+    for r in rows:
+        mark = "✅ connected" if r["connected"] else "❌ not connected"
+        user = r["user"] or "(unknown)"
+        detail = "" if r["connected"] else f" — {r['status']}"
+        lines.append(
+            f"- {r['name']}: {mark} | user {user} | "
+            f"{r['url']} (client {r['client']}, auth {r['auth']}){detail}")
+    return "\n".join(lines)
+
+
 def resolve_and_get(registry: SystemRegistry, adt: ADTClient,
                     system: str, object_type: str, name: str,
                     function_group: str | None) -> str:
@@ -53,7 +67,8 @@ def resolve_and_refresh(registry: SystemRegistry, system: str) -> str:
 
 
 CORE_TOOLS = {
-    "list_systems", "list_package", "search_objects", "get_source",
+    "list_systems", "check_connection", "list_package", "search_objects",
+    "get_source",
     "get_source_by_uri", "get_context", "grep_package", "find_references",
     "update_source", "update_class_include", "create_object", "activate",
     "syntax_check", "run_unit_tests", "data_preview", "refresh_cookies_for",
@@ -80,6 +95,15 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
     def list_systems() -> str:
         """List configured SAP systems available for source retrieval."""
         return format_systems(registry.list())
+
+    @tool("check_connection")
+    def check_connection() -> str:
+        """Test connectivity of all configured SAP systems (like the web Test).
+
+        Probes each system's ADT discovery endpoint and reports whether it is
+        connected and which user the connection authenticates as.
+        """
+        return format_connections(adt.check_connections(registry.list()))
 
     @tool("get_source")
     def get_source(system: str, object_type: str, name: str,
