@@ -352,6 +352,40 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
             return err
         return adt.get_dump(sys, dump_uri)
 
+    @tool("list_feeds")
+    def list_feeds(system: str) -> str:
+        """List ABAP monitoring feeds the system offers (SAP Gateway Error Log, ABAP System Messages, ABAP Runtime Errors, ATC Findings, ...), each with a friendly alias for read_feed."""
+        sys, err = _resolve(system)
+        if err:
+            return err
+        return adt.list_feeds(sys)
+
+    @tool("read_feed")
+    def read_feed(system: str, feed: str, from_date: str = "", to_date: str = "",
+                  user: str = "", object: str = "", max: int = 50) -> str:
+        """Read one ABAP feed newest-first. feed = alias (gateway_log/system_messages/dumps/event_log/uri_errors/atc/contract_violations) or a title substring. Optional filters: from_date/to_date ('yyyy-mm-dd'), user, object substring. For full ST22 dump bodies use list_dumps/get_dump."""
+        sys, err = _resolve(system)
+        if err:
+            return err
+        return adt.read_feed(sys, feed, from_date or None, to_date or None,
+                             user or None, object or None, max)
+
+    @tool("list_transports")
+    def list_transports(system: str) -> str:
+        """List the session user's open (modifiable) transport requests — number, type/status, owner, description. Use the number as `transport` for create_object/update_source."""
+        sys, err = _resolve(system)
+        if err:
+            return err
+        return adt.list_transports(sys)
+
+    @tool("create_transport")
+    def create_transport(system: str, description: str) -> str:
+        """Create a workbench transport request (write — requires allow_write); returns the new request number to pass as `transport` to write tools."""
+        sys, err = _resolve(system)
+        if err:
+            return err
+        return adt.create_transport(sys, description)
+
     @tool("pretty_print")
     def pretty_print(system: str, source: str) -> str:
         """Format ABAP source via ADT pretty printer (applies the system's keyword-case/indent settings). Returns formatted code."""

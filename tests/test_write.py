@@ -32,6 +32,21 @@ def test_check_write_package_whitelist():
     assert check_write(_sys(write_packages=["ZRAP_*"]), "ZOTHER")
 
 
+def test_check_write_object_allowlist():
+    # write_objects (when set) gates by object name in addition to the package.
+    # Default None = unrestricted (existing behaviour), so passing an object
+    # name must not change anything.
+    assert check_write(_sys(), "ZPKG", "ZCL_ANYTHING") is None
+    # Restricted to ZCL_ORDER*: a matching object passes, others are rejected.
+    s = _sys(write_objects=["ZCL_ORDER*"])
+    assert check_write(s, "ZPKG", "ZCL_ORDER_MGR") is None
+    assert check_write(s, "ZPKG", "zcl_order_mgr") is None          # case-insensitive
+    rej = check_write(s, "ZPKG", "ZCL_CUSTOMER")
+    assert rej and "not in write_objects" in rej
+    # Package gate still applies first even when the object matches.
+    assert "not in write_packages" in check_write(s, "SAPPKG", "ZCL_ORDER_X")
+
+
 # --- parsers / paths ---
 def test_object_root_path():
     assert object_root_path("CLAS", "zcl_a") == "/sap/bc/adt/oo/classes/ZCL_A"
@@ -165,6 +180,28 @@ def test_create_object_ok_no_source():
         return httpx.Response(201, text="")
     out = _client(handler).create_object(_sys(), "DDLS", "ZR", "ZPKG", "desc")
     assert out.startswith("OK: created DDLS ZR")
+
+
+def test_create_object_pins_sap_language():
+    # The create POST must carry sap-language matching system.language so SAP
+    # writes the description in the same language as adtcore:masterLanguage in
+    # the body. Otherwise the description follows the session logon language and
+    # a mismatch (e.g. session JA vs original EN) triggers HTTP 400. See
+    # adt_client.create_object.
+    seen = {"url": None, "body": None}
+
+    def handler(req):
+        if "discovery" in str(req.url):
+            return httpx.Response(200, headers={"x-csrf-token": "T"})
+        seen["url"] = str(req.url)
+        seen["body"] = req.content.decode("utf-8")
+        return httpx.Response(201, text="")
+
+    out = _client(handler).create_object(
+        _sys(language="EN"), "DDLS", "ZR", "ZPKG", "desc")
+    assert out.startswith("OK: created DDLS ZR")
+    assert "sap-language=EN" in seen["url"]
+    assert 'adtcore:masterLanguage="EN"' in seen["body"]
 
 
 # --- CSRF token caching + refetch (fix 1) ---
