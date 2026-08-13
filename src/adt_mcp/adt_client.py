@@ -140,6 +140,29 @@ def parse_lock_handle(data: bytes) -> str:
     return parse_lock_result(data)[0]
 
 
+def parse_adt_exception(data: bytes) -> tuple[str, str]:
+    """Return (exception_type_id, message) from an ADT error payload.
+
+    ADT reports failures as <exc:exception> with a <type id="..."/> and a
+    <message>text</message>. Returns ("", "") when the body is missing or not
+    such an XML document.
+    """
+    if not data:
+        return "", ""
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return "", ""
+    type_id, message = "", ""
+    for el in root.iter():
+        ln = _localname(el.tag)
+        if ln == "type" and not type_id:
+            type_id = (el.attrib.get("id") or "").strip()
+        elif ln == "message" and not message:
+            message = (el.text or "").strip()
+    return type_id, message
+
+
 def parse_activation(data: bytes) -> str:
     """Return 'OK' or an error string from an activation response."""
     if not data:
@@ -2303,7 +2326,26 @@ class ADTClient:
         except httpx.HTTPError as e:
             return "", f"Error: lock request failed: {e}"
         if resp.status_code != 200:
-            return "", f"Error: lock failed (HTTP {resp.status_code}): {resp.text[:200]}"
+            exc_type, msg = parse_adt_exception(resp.content)
+            # ExceptionResourceNoAccess / ...AlreadyLocked on LOCK means the
+            # object is enqueue-locked in ANOTHER session — typically open in an
+            # Eclipse ADT editor, or a stale lock left by an earlier crashed
+            # write (same user, different session). refresh_cookies_for CANNOT
+            # release it: a new cookie session does not own the foreign enqueue.
+            if exc_type in ("ExceptionResourceNoAccess",
+                            "ExceptionResourceAlreadyLocked"):
+                detail = f" — server: {msg}" if msg else ""
+                return "", (
+                    f"Error: cannot lock object for editing (ADT "
+                    f"{exc_type}, HTTP {resp.status_code}): it is locked in "
+                    f"another session. Most likely it is open in an Eclipse "
+                    f"ADT editor, or a stale lock from an earlier write is "
+                    f"still held. This is NOT a cookie/session-expiry problem, "
+                    f"so refresh_cookies_for will not help — close the object "
+                    f"in Eclipse (or wait for the stale lock to time out) and "
+                    f"retry.{detail}")
+            detail = msg or resp.text[:300]
+            return "", f"Error: lock failed (HTTP {resp.status_code}): {detail}"
         handle, _mod = parse_lock_result(resp.content)
         # Note: MODIFICATION_SUPPORT="NoModification" is informational on cloud
         # (local / no version mgmt) and does NOT block writes — a PUT with the

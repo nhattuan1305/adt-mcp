@@ -3,7 +3,7 @@ import pytest
 from adt_mcp.registry import System
 from adt_mcp.adt_client import (
     ADTClient, check_write, object_root_path, parse_lock_handle,
-    parse_activation, build_creation_body)
+    parse_activation, parse_adt_exception, build_creation_body)
 
 
 def _sys(allow_write=True, **kw):
@@ -58,6 +58,19 @@ def test_parse_lock_handle():
     xml = b'<asx><values><DATA><LOCK_HANDLE>ABC123</LOCK_HANDLE></DATA></values></asx>'
     assert parse_lock_handle(xml) == "ABC123"
     assert parse_lock_handle(b"") == ""
+
+
+def test_parse_adt_exception():
+    xml = (b'<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/'
+           b'communicationframework"><namespace id="com.sap.adt"/>'
+           b'<type id="ExceptionResourceNoAccess"/>'
+           b'<message lang="EN">Resource ZCL_A is locked</message>'
+           b'</exc:exception>')
+    t, m = parse_adt_exception(xml)
+    assert t == "ExceptionResourceNoAccess"
+    assert "locked" in m
+    assert parse_adt_exception(b"") == ("", "")
+    assert parse_adt_exception(b"not xml") == ("", "")
 
 
 def test_parse_activation():
@@ -165,6 +178,39 @@ def test_update_source_lock_no_handle_fails():
     out = _client(_seq_handler([], lock_body=nm)).update_source(
         _sys(), "CLAS", "ZCL_A", "x")
     assert "no lock handle" in out.lower()
+
+
+def test_lock_resource_no_access_gives_actionable_error():
+    # HTTP 403 ExceptionResourceNoAccess on LOCK = the object is enqueue-locked
+    # by ANOTHER session of the same user (open in Eclipse ADT, or a stale lock
+    # from a crashed write). It is NOT a cookie/session-expiry problem, so the
+    # error must steer the user away from refresh_cookies and toward releasing
+    # the foreign lock — and must surface the ADT exception + server message.
+    def handler(req):
+        u = str(req.url)
+        if "discovery" in u:
+            return httpx.Response(200, headers={"x-csrf-token": "T"})
+        if req.method == "GET":
+            return httpx.Response(
+                200, headers={"content-type": "application/xml"},
+                content=b'<r><adtcore:packageRef xmlns:adtcore="x" '
+                        b'adtcore:name="ZPKG"/></r>')
+        if "_action=LOCK" in u:
+            return httpx.Response(
+                403, headers={"content-type": "application/xml"},
+                content=b'<exc:exception xmlns:exc="x">'
+                        b'<namespace id="com.sap.adt"/>'
+                        b'<type id="ExceptionResourceNoAccess"/>'
+                        b'<message lang="EN">Resource is being edited</message>'
+                        b'</exc:exception>')
+        return httpx.Response(404)
+
+    out = _client(handler).update_source(_sys(), "CLAS", "ZCL_A", "x").lower()
+    assert "another session" in out
+    assert "eclipse" in out
+    assert "exceptionresourcenoaccess" in out
+    assert "being edited" in out          # server message surfaced, not dropped
+    assert "not a cookie" in out          # steer away from refresh_cookies
 
 
 def test_create_object_srvb_requires_servicedef():
