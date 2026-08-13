@@ -11,8 +11,15 @@ from urllib.parse import urlsplit, quote
 from .registry import System
 
 
-def check_write(system: System, package: str) -> str | None:
-    """Safety gate: writes require allow_write + a whitelisted target package."""
+def check_write(system: System, package: str,
+                object_name: str = "") -> str | None:
+    """Safety gate: writes require allow_write + a whitelisted target package.
+
+    When ``system.write_objects`` is set, the object name must additionally
+    match one of its patterns (fnmatch, case-insensitive) — an allow-list that
+    restricts which objects agents may touch. Left unset (None) it imposes no
+    object-level restriction, preserving prior behaviour.
+    """
     if not system.allow_write:
         return (f"Error: writes disabled for system {system.name!r} "
                 f"(set allow_write=true in systems.json)")
@@ -22,6 +29,12 @@ def check_write(system: System, package: str) -> str | None:
         return "Error: could not determine target package"
     if not any(fnmatch.fnmatch(pkg, p.upper()) for p in pats):
         return f"Error: package {package!r} not in write_packages {pats}"
+    if system.write_objects is not None:
+        obj = (object_name or "").upper()
+        if not any(fnmatch.fnmatch(obj, p.upper())
+                   for p in system.write_objects):
+            return (f"Error: object {object_name!r} not in write_objects "
+                    f"{system.write_objects}")
     return None
 
 
@@ -125,6 +138,29 @@ def parse_lock_result(data: bytes) -> tuple[str, str]:
 def parse_lock_handle(data: bytes) -> str:
     """Extract the lock handle from a LOCK response."""
     return parse_lock_result(data)[0]
+
+
+def parse_adt_exception(data: bytes) -> tuple[str, str]:
+    """Return (exception_type_id, message) from an ADT error payload.
+
+    ADT reports failures as <exc:exception> with a <type id="..."/> and a
+    <message>text</message>. Returns ("", "") when the body is missing or not
+    such an XML document.
+    """
+    if not data:
+        return "", ""
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return "", ""
+    type_id, message = "", ""
+    for el in root.iter():
+        ln = _localname(el.tag)
+        if ln == "type" and not type_id:
+            type_id = (el.attrib.get("id") or "").strip()
+        elif ln == "message" and not message:
+            message = (el.text or "").strip()
+    return type_id, message
 
 
 def parse_activation(data: bytes) -> str:
@@ -449,6 +485,56 @@ def parse_release_state(data: bytes) -> dict:
     return out
 
 
+def parse_transports(data: bytes) -> list[dict]:
+    """Parse a CTS transportorganizertree response into request dicts.
+
+    Each: {number, description, type, status, target, owner}. type 'K' is a
+    workbench request, 'W'/'C' customizing; status 'D' is modifiable, 'R'
+    released. owner falls back from the request's adtcore:createdBy to a nested
+    task's tm:owner. An empty <tm:root/> (user has no open requests) yields [].
+    """
+    if not data:
+        return []
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return []
+    out = []
+    for el in root.iter():
+        if _localname(el.tag) != "request":
+            continue
+        a = {_localname(k): v for k, v in el.attrib.items()}
+        owner = a.get("createdBy", "") or a.get("owner", "")
+        if not owner:
+            for task in el:
+                if _localname(task.tag) == "task":
+                    ta = {_localname(k): v for k, v in task.attrib.items()}
+                    owner = ta.get("owner", "") or ta.get("createdBy", "")
+                    if owner:
+                        break
+        out.append({
+            "number": a.get("number", ""),
+            "description": a.get("desc", ""),
+            "type": a.get("type", ""),
+            "status": a.get("status", ""),
+            "target": a.get("target", ""),
+            "owner": owner,
+        })
+    return out
+
+
+def build_transport_body(description: str, req_type: str = "K",
+                         target: str = "", owner: str = "") -> str:
+    """POST body to create a CTS request (tm:useraction='newrequest')."""
+    task = f'<tm:task tm:owner="{owner}"/>' if owner else ""
+    return (f'<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<tm:root xmlns:tm="http://www.sap.com/cts/adt/tm" '
+            f'tm:useraction="newrequest">\n'
+            f'  <tm:request tm:desc="{description}" tm:type="{req_type}" '
+            f'tm:target="{target}" tm:cts_project="">\n'
+            f'    {task}\n  </tm:request>\n</tm:root>')
+
+
 def parse_netscape_cookies(text: str) -> dict[str, str]:
     cookies: dict[str, str] = {}
     for line in text.splitlines():
@@ -568,6 +654,92 @@ def parse_revision_feed(data: bytes) -> list[dict]:
                 if "transportrequests" in attrs.get("type", ""):
                     rev["transport"] = attrs.get("name", "")
         out.append(rev)
+    return out
+
+
+# Friendly key -> feed title as it appears in the /sap/bc/adt/feeds catalog.
+# Covers the feeds SAP's "Read ABAP Feeds" MCP tool exposes (gateway error log,
+# system messages, dumps) plus the other monitoring feeds the catalog offers.
+FEED_ALIASES = {
+    "gateway_log": "SAP Gateway Error Log",
+    "system_messages": "ABAP System Messages",
+    "dumps": "ABAP Runtime Errors",
+    "event_log": "Enterprise Event Enablement Error Log",
+    "uri_errors": "URI Creation Errors",
+    "atc": "ATC Findings",
+    "contract_violations": "ABAP Contract Check Violations",
+}
+
+
+def parse_feed_catalog(data: bytes) -> list[dict]:
+    """Parse the /sap/bc/adt/feeds catalog into {title, href, summary} dicts.
+
+    Each atom:entry describes one feed; its href (atom:link/@href, falling back
+    to atom:content/@src or atom:id) is the URL to GET that feed's entries.
+    """
+    if not data:
+        return []
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return []
+    out = []
+    for entry in root.iter():
+        if _localname(entry.tag) != "entry":
+            continue
+        title = summary = href = src = idv = ""
+        for ch in entry:
+            ln = _localname(ch.tag)
+            a = {_localname(k): v for k, v in ch.attrib.items()}
+            if ln == "title" and not title:
+                title = (ch.text or "").strip()
+            elif ln == "summary":
+                summary = (ch.text or "").strip()
+            elif ln == "link" and not href:
+                href = a.get("href", "")
+            elif ln == "content" and not src:
+                src = a.get("src", "")
+            elif ln == "id" and not idv:
+                idv = (ch.text or "").strip()
+        link = href or src or idv
+        if title and link:
+            out.append({"title": title, "href": link, "summary": summary})
+    return out
+
+
+def parse_feed_entries(data: bytes) -> list[dict]:
+    """Parse a single ADT feed (gateway log, system messages, …) into entries.
+
+    Each: {title, uri, author, date, summary}. Mirrors parse_dumps_feed — the
+    entry body is carried in atom:summary; the id is a logical key.
+    """
+    if not data:
+        return []
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return []
+    out = []
+    for entry in root.iter():
+        if _localname(entry.tag) != "entry":
+            continue
+        d = {"title": "", "uri": "", "author": "", "date": "", "summary": ""}
+        for ch in entry:
+            ln = _localname(ch.tag)
+            if ln == "title" and not d["title"]:
+                d["title"] = (ch.text or "").strip()
+            elif ln == "id" and not d["uri"]:
+                d["uri"] = (ch.text or "").strip()
+            elif ln in ("updated", "published") and not d["date"]:
+                d["date"] = (ch.text or "").strip()
+            elif ln == "author":
+                for a in ch:
+                    if _localname(a.tag) == "name":
+                        d["author"] = (a.text or "").strip()
+            elif ln == "summary":
+                d["summary"] = (ch.text or "").strip()
+        if d["title"] or d["uri"]:
+            out.append(d)
     return out
 
 
@@ -1832,6 +2004,181 @@ class ADTClient:
                 f" keyUser={'yes' if c['keyUser'] else 'no'}{succ}")
         return "\n".join(lines)
 
+    # --- ABAP feeds (gateway log, system messages, monitoring) ---
+
+    FEEDS_BASE = "/sap/bc/adt/feeds"
+
+    def _fetch_feed_catalog(self, system: System) -> "list[dict] | str":
+        url = f"{base_url(system.url)}{self.FEEDS_BASE}?sap-client={system.client}"
+        try:
+            resp = self._get(system, url, "application/atom+xml;type=feed")
+        except httpx.HTTPError as e:
+            return f"Error: feeds request failed: {e}"
+        if resp.status_code in (401, 403):
+            return (f"Error: auth failed (HTTP {resp.status_code}) — refresh "
+                    f"cookies for system {system.name!r}")
+        if resp.status_code != 200:
+            return f"Error: feeds catalog failed (HTTP {resp.status_code})"
+        if is_login_page(resp):
+            return (f"Error: session expired for system {system.name!r} "
+                    f"— refresh cookies and retry")
+        return parse_feed_catalog(resp.content)
+
+    def list_feeds(self, system: System) -> str:
+        """List the ABAP feeds this system offers (gateway log, system messages…).
+
+        Shows the friendly alias (for read_feed) next to each catalog title.
+        """
+        catalog = self._fetch_feed_catalog(system)
+        if isinstance(catalog, str):
+            return catalog
+        if not catalog:
+            return "No feeds offered by this system."
+        title_to_alias = {v: k for k, v in FEED_ALIASES.items()}
+        lines = [f"ABAP feeds ({len(catalog)}):"]
+        for f in catalog:
+            alias = title_to_alias.get(f["title"], "")
+            tag = f"  (alias: {alias})" if alias else ""
+            lines.append(f"  {f['title']}{tag}\n      {f['href']}")
+        return "\n".join(lines)
+
+    def read_feed(self, system: System, feed: str,
+                  from_date: str | None = None, to_date: str | None = None,
+                  user: str | None = None, object: str | None = None,
+                  max: int = 50) -> str:
+        """Read one ABAP feed's entries, newest first.
+
+        `feed` accepts an alias (gateway_log, system_messages, dumps, event_log,
+        uri_errors, atc, contract_violations) or a case-insensitive substring of
+        the catalog title. Filters (from_date/to_date as 'yyyy-mm-dd' prefixes,
+        user, object substring) are applied to the parsed entries; `max` caps
+        the count. For full ST22 dump bodies use list_dumps / get_dump instead.
+        """
+        catalog = self._fetch_feed_catalog(system)
+        if isinstance(catalog, str):
+            return catalog
+        title = FEED_ALIASES.get(feed.lower().strip())
+        match = None
+        for f in catalog:
+            if title and f["title"] == title:
+                match = f
+                break
+        if match is None:
+            key = feed.lower().strip()
+            for f in catalog:
+                if key in f["title"].lower():
+                    match = f
+                    break
+        if match is None:
+            aliases = ", ".join(sorted(FEED_ALIASES))
+            titles = "; ".join(f["title"] for f in catalog)
+            return (f"Error: unknown feed {feed!r}. Aliases: {aliases}. "
+                    f"Available feeds: {titles}")
+        href = match["href"]
+        sep = "&" if "?" in href else "?"
+        url = f"{base_url(system.url)}{href}{sep}sap-client={system.client}"
+        try:
+            resp = self._get(system, url, "application/atom+xml;type=feed")
+        except httpx.HTTPError as e:
+            return f"Error: feed request failed: {e}"
+        if resp.status_code != 200:
+            return f"Error: feed failed (HTTP {resp.status_code})"
+        if is_login_page(resp):
+            return (f"Error: session expired for system {system.name!r} "
+                    f"— refresh cookies and retry")
+        entries = parse_feed_entries(resp.content)
+        # Client-side filters — robust regardless of per-feed query support.
+        if user:
+            u = user.lower()
+            entries = [e for e in entries if u in e["author"].lower()]
+        if object:
+            o = object.lower()
+            entries = [e for e in entries
+                       if o in e["title"].lower() or o in e["summary"].lower()]
+        if from_date:
+            entries = [e for e in entries if e["date"][:10] >= from_date]
+        if to_date:
+            entries = [e for e in entries if e["date"][:10] <= to_date]
+        if not entries:
+            return f"No entries in feed {match['title']!r} for those filters."
+        entries.sort(key=lambda e: e["date"], reverse=True)
+        lines = [f"{match['title']} ({len(entries)} entries, newest first):"]
+        for e in entries[:max]:
+            snippet = html_to_text(e["summary"]).replace("\n", " ")[:160]
+            lines.append(
+                f"  {e['date']}  {e['author'] or '?':<12}  {e['title']}"
+                + (f"\n      {snippet}" if snippet else ""))
+        return "\n".join(lines)
+
+    # --- Transports (CTS) ---
+
+    TRANSPORTS_BASE = "/sap/bc/adt/cts/transportrequests"
+    _TR_TREE_ACCEPT = "application/vnd.sap.adt.transportorganizertree.v1+xml"
+
+    def list_transports(self, system: System) -> str:
+        """List the session user's open (modifiable) transport requests.
+
+        Reads the CTS transport organizer tree. Each line shows the request
+        number to pass as `transport` to create_object/update_source.
+        """
+        url = (f"{base_url(system.url)}{self.TRANSPORTS_BASE}"
+               f"?sap-client={system.client}")
+        try:
+            resp = self._get(system, url, self._TR_TREE_ACCEPT)
+        except httpx.HTTPError as e:
+            return f"Error: request failed: {e}"
+        if resp.status_code in (401, 403):
+            return (f"Error: auth failed (HTTP {resp.status_code}) — refresh "
+                    f"cookies for system {system.name!r}")
+        if resp.status_code != 200:
+            return f"Error: HTTP {resp.status_code}: {resp.text[:200]}"
+        if is_login_page(resp):
+            return (f"Error: session expired for system {system.name!r} "
+                    f"— refresh cookies and retry")
+        rows = parse_transports(resp.content)
+        if not rows:
+            return "No open transport requests."
+        lines = [f"Open transport requests ({len(rows)}):"]
+        for r in rows:
+            lines.append(
+                f"  {r['number']}  [{r['type']}/{r['status']}] "
+                f"{r['owner'] or '?':<12}  {r['description']}")
+        return "\n".join(lines)
+
+    def create_transport(self, system: System, description: str) -> str:
+        """Create a workbench transport request; return its new number.
+
+        A transport isn't package-scoped, so only the allow_write flag gates it
+        (not the package/object allow-lists check_write enforces on objects).
+        """
+        if not system.allow_write:
+            return (f"Error: writes disabled for system {system.name!r} "
+                    f"(set allow_write=true in systems.json)")
+        if not (description or "").strip():
+            return "Error: description is required"
+        url = f"{base_url(system.url)}{self.TRANSPORTS_BASE}?sap-client={system.client}"
+        body = build_transport_body(description, owner=(system.username or ""))
+        try:
+            resp = self._post(system, url, self._TR_TREE_ACCEPT,
+                              body.encode("utf-8"),
+                              "application/vnd.sap.adt.transportorganizer.v1+xml")
+        except httpx.HTTPError as e:
+            return f"Error: request failed: {e}"
+        if resp.status_code not in (200, 201):
+            return f"Error: create failed (HTTP {resp.status_code}): {resp.text[:300]}"
+        if is_login_page(resp):
+            return (f"Error: session expired for system {system.name!r} "
+                    f"— refresh cookies and retry")
+        rows = parse_transports(resp.content)
+        number = rows[0]["number"] if rows else ""
+        if not number:
+            m = re.search(r"(?:tm:number=\"|/transportrequests/)([A-Z0-9]+)",
+                          resp.text)
+            number = m.group(1) if m else ""
+        if not number:
+            return f"Error: created but no request number returned: {resp.text[:200]}"
+        return f"OK: created transport {number} ({description})"
+
     # --- Context compression (v2 Phase 6) ---
 
     @staticmethod
@@ -1979,7 +2326,26 @@ class ADTClient:
         except httpx.HTTPError as e:
             return "", f"Error: lock request failed: {e}"
         if resp.status_code != 200:
-            return "", f"Error: lock failed (HTTP {resp.status_code}): {resp.text[:200]}"
+            exc_type, msg = parse_adt_exception(resp.content)
+            # ExceptionResourceNoAccess / ...AlreadyLocked on LOCK means the
+            # object is enqueue-locked in ANOTHER session — typically open in an
+            # Eclipse ADT editor, or a stale lock left by an earlier crashed
+            # write (same user, different session). refresh_cookies_for CANNOT
+            # release it: a new cookie session does not own the foreign enqueue.
+            if exc_type in ("ExceptionResourceNoAccess",
+                            "ExceptionResourceAlreadyLocked"):
+                detail = f" — server: {msg}" if msg else ""
+                return "", (
+                    f"Error: cannot lock object for editing (ADT "
+                    f"{exc_type}, HTTP {resp.status_code}): it is locked in "
+                    f"another session. Most likely it is open in an Eclipse "
+                    f"ADT editor, or a stale lock from an earlier write is "
+                    f"still held. This is NOT a cookie/session-expiry problem, "
+                    f"so refresh_cookies_for will not help — close the object "
+                    f"in Eclipse (or wait for the stale lock to time out) and "
+                    f"retry.{detail}")
+            detail = msg or resp.text[:300]
+            return "", f"Error: lock failed (HTTP {resp.status_code}): {detail}"
         handle, _mod = parse_lock_result(resp.content)
         # Note: MODIFICATION_SUPPORT="NoModification" is informational on cloud
         # (local / no version mgmt) and does NOT block writes — a PUT with the
@@ -2129,7 +2495,7 @@ class ADTClient:
         except ValueError as e:
             return f"Error: {e}"
         pkg = self.object_package(system, object_type, name, function_group)
-        gate = check_write(system, pkg or "")
+        gate = check_write(system, pkg or "", name)
         if gate:
             return gate
         source_url = (f"{root_url}/source/main?sap-client={system.client}"
@@ -2152,7 +2518,7 @@ class ADTClient:
         if not system.allow_write:
             return check_write(system, "")
         pkg = self.object_package(system, "CLAS", class_name)
-        gate = check_write(system, pkg or "")
+        gate = check_write(system, pkg or "", class_name)
         if gate:
             return gate
         root_url = self.object_root_url(system, "CLAS", class_name)
@@ -2180,7 +2546,7 @@ class ADTClient:
         if ot not in CREATE_TYPES:
             return (f"Error: cannot create type {object_type!r}; valid: "
                     f"{', '.join(CREATE_TYPES)}")
-        gate = check_write(system, package)
+        gate = check_write(system, package, name)
         if gate:
             return gate
         path, root, ns, adt_type, content_type, source_capable = CREATE_TYPES[ot]
@@ -2193,9 +2559,17 @@ class ADTClient:
         body = build_creation_body(ot, name, package, description, responsible,
                                    service_definition, binding_version,
                                    language=system.language)
-        url = f"{base_url(system.url)}{path}"
+        # Pin sap-language on the create URL so SAP writes the description in
+        # system.language, matching adtcore:masterLanguage in the body. Without
+        # it the description is written in the *session logon language*, which
+        # can differ from masterLanguage after a headless re-login picks up the
+        # user's SAP default language (e.g. JA) -> HTTP 400 "Language JA for
+        # creation of description is not equal to original EN". Every other
+        # write path (update_source, update_class_include) already pins it.
+        url = (f"{base_url(system.url)}{path}"
+               f"?sap-client={system.client}&sap-language={system.language}")
         if transport:
-            url += f"?corrNr={quote(transport, safe='')}"
+            url += f"&corrNr={quote(transport, safe='')}"
         try:
             resp = self._post(system, url, "application/*",
                               body.encode("utf-8"), content_type)

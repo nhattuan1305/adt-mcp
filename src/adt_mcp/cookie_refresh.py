@@ -13,6 +13,8 @@ import re
 import time
 from pathlib import Path
 
+from .paths import cookies_dir
+
 DEFAULT_TIMEOUT_MS = 30000
 
 # Per-platform: which cookies actually carry the ADT session.
@@ -156,7 +158,7 @@ def _write_netscape(path: Path, cookies: list, url: str) -> int:
 def _profile_dir() -> str:
     """Persistent browser profile so the SSO session is remembered across
     logins (next login goes straight through without retyping)."""
-    d = Path(__file__).resolve().parent.parent.parent / "cookies" / ".browser_profile"
+    d = Path(cookies_dir()) / ".browser_profile"
     d.mkdir(parents=True, exist_ok=True)
     return str(d)
 

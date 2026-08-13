@@ -166,7 +166,7 @@ def test_clone_package_execute_rewrites_dependent_source():
         if req.method == "GET" and "zc_fun_mf902/source/main" in u.lower():
             return httpx.Response(200, text="define view entity ZC_FUN_MF902 "
                                   "as select from ZI_FUN_MF902 { key id }")
-        if req.method == "POST" and u.endswith("/ddic/ddl/sources"):
+        if req.method == "POST" and u.split("?")[0].endswith("/ddic/ddl/sources"):
             return httpx.Response(201, text="")
         if req.method == "GET" and "ddl/sources/" in u and "/source/main" not in u:
             return httpx.Response(
@@ -259,9 +259,9 @@ def test_clone_package_execute_srvb_remaps_service_definition():
                 200, headers={"content-type": "application/xml"},
                 content=b'<r><adtcore:packageRef xmlns:adtcore="x" '
                         b'adtcore:name="ZRAP_FUN_MF902_VN"/></r>')
-        if req.method == "POST" and u.endswith("/ddic/srvd/sources"):
+        if req.method == "POST" and u.split("?")[0].endswith("/ddic/srvd/sources"):
             return httpx.Response(201, text="")
-        if req.method == "POST" and u.endswith("/businessservices/bindings"):
+        if req.method == "POST" and u.split("?")[0].endswith("/businessservices/bindings"):
             posts[u] = req.content.decode()
             return httpx.Response(201, text="")
         if "_action=LOCK" in u:
@@ -321,7 +321,7 @@ def test_clone_package_execute_clas_rewrites_includes():
                 200, headers={"content-type": "application/xml"},
                 content=b'<r><adtcore:packageRef xmlns:adtcore="x" '
                         b'adtcore:name="ZRAP_FUN_MF902_VN"/></r>')
-        if req.method == "POST" and u.endswith("/oo/classes"):
+        if req.method == "POST" and u.split("?")[0].endswith("/oo/classes"):
             return httpx.Response(201, text="")
         if "_action=LOCK" in u:
             return httpx.Response(
@@ -377,7 +377,7 @@ def test_clone_package_clas_writes_main_before_testclasses():
                 200, headers={"content-type": "application/xml"},
                 content=b'<r><adtcore:packageRef xmlns:adtcore="x" '
                         b'adtcore:name="ZRAP_FUN_MF902_VN"/></r>')
-        if req.method == "POST" and u.endswith("/oo/classes"):
+        if req.method == "POST" and u.split("?")[0].endswith("/oo/classes"):
             return httpx.Response(201, text="")
         if "_action=LOCK" in u:
             return httpx.Response(

@@ -3,7 +3,7 @@ import pytest
 from adt_mcp.registry import System
 from adt_mcp.adt_client import (
     ADTClient, check_write, object_root_path, parse_lock_handle,
-    parse_activation, build_creation_body)
+    parse_activation, parse_adt_exception, build_creation_body)
 
 
 def _sys(allow_write=True, **kw):
@@ -32,6 +32,21 @@ def test_check_write_package_whitelist():
     assert check_write(_sys(write_packages=["ZRAP_*"]), "ZOTHER")
 
 
+def test_check_write_object_allowlist():
+    # write_objects (when set) gates by object name in addition to the package.
+    # Default None = unrestricted (existing behaviour), so passing an object
+    # name must not change anything.
+    assert check_write(_sys(), "ZPKG", "ZCL_ANYTHING") is None
+    # Restricted to ZCL_ORDER*: a matching object passes, others are rejected.
+    s = _sys(write_objects=["ZCL_ORDER*"])
+    assert check_write(s, "ZPKG", "ZCL_ORDER_MGR") is None
+    assert check_write(s, "ZPKG", "zcl_order_mgr") is None          # case-insensitive
+    rej = check_write(s, "ZPKG", "ZCL_CUSTOMER")
+    assert rej and "not in write_objects" in rej
+    # Package gate still applies first even when the object matches.
+    assert "not in write_packages" in check_write(s, "SAPPKG", "ZCL_ORDER_X")
+
+
 # --- parsers / paths ---
 def test_object_root_path():
     assert object_root_path("CLAS", "zcl_a") == "/sap/bc/adt/oo/classes/ZCL_A"
@@ -43,6 +58,19 @@ def test_parse_lock_handle():
     xml = b'<asx><values><DATA><LOCK_HANDLE>ABC123</LOCK_HANDLE></DATA></values></asx>'
     assert parse_lock_handle(xml) == "ABC123"
     assert parse_lock_handle(b"") == ""
+
+
+def test_parse_adt_exception():
+    xml = (b'<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/'
+           b'communicationframework"><namespace id="com.sap.adt"/>'
+           b'<type id="ExceptionResourceNoAccess"/>'
+           b'<message lang="EN">Resource ZCL_A is locked</message>'
+           b'</exc:exception>')
+    t, m = parse_adt_exception(xml)
+    assert t == "ExceptionResourceNoAccess"
+    assert "locked" in m
+    assert parse_adt_exception(b"") == ("", "")
+    assert parse_adt_exception(b"not xml") == ("", "")
 
 
 def test_parse_activation():
@@ -152,6 +180,39 @@ def test_update_source_lock_no_handle_fails():
     assert "no lock handle" in out.lower()
 
 
+def test_lock_resource_no_access_gives_actionable_error():
+    # HTTP 403 ExceptionResourceNoAccess on LOCK = the object is enqueue-locked
+    # by ANOTHER session of the same user (open in Eclipse ADT, or a stale lock
+    # from a crashed write). It is NOT a cookie/session-expiry problem, so the
+    # error must steer the user away from refresh_cookies and toward releasing
+    # the foreign lock — and must surface the ADT exception + server message.
+    def handler(req):
+        u = str(req.url)
+        if "discovery" in u:
+            return httpx.Response(200, headers={"x-csrf-token": "T"})
+        if req.method == "GET":
+            return httpx.Response(
+                200, headers={"content-type": "application/xml"},
+                content=b'<r><adtcore:packageRef xmlns:adtcore="x" '
+                        b'adtcore:name="ZPKG"/></r>')
+        if "_action=LOCK" in u:
+            return httpx.Response(
+                403, headers={"content-type": "application/xml"},
+                content=b'<exc:exception xmlns:exc="x">'
+                        b'<namespace id="com.sap.adt"/>'
+                        b'<type id="ExceptionResourceNoAccess"/>'
+                        b'<message lang="EN">Resource is being edited</message>'
+                        b'</exc:exception>')
+        return httpx.Response(404)
+
+    out = _client(handler).update_source(_sys(), "CLAS", "ZCL_A", "x").lower()
+    assert "another session" in out
+    assert "eclipse" in out
+    assert "exceptionresourcenoaccess" in out
+    assert "being edited" in out          # server message surfaced, not dropped
+    assert "not a cookie" in out          # steer away from refresh_cookies
+
+
 def test_create_object_srvb_requires_servicedef():
     out = _client(lambda r: httpx.Response(200)).create_object(
         _sys(), "SRVB", "ZSB", "ZPKG", service_definition=None)
@@ -165,6 +226,28 @@ def test_create_object_ok_no_source():
         return httpx.Response(201, text="")
     out = _client(handler).create_object(_sys(), "DDLS", "ZR", "ZPKG", "desc")
     assert out.startswith("OK: created DDLS ZR")
+
+
+def test_create_object_pins_sap_language():
+    # The create POST must carry sap-language matching system.language so SAP
+    # writes the description in the same language as adtcore:masterLanguage in
+    # the body. Otherwise the description follows the session logon language and
+    # a mismatch (e.g. session JA vs original EN) triggers HTTP 400. See
+    # adt_client.create_object.
+    seen = {"url": None, "body": None}
+
+    def handler(req):
+        if "discovery" in str(req.url):
+            return httpx.Response(200, headers={"x-csrf-token": "T"})
+        seen["url"] = str(req.url)
+        seen["body"] = req.content.decode("utf-8")
+        return httpx.Response(201, text="")
+
+    out = _client(handler).create_object(
+        _sys(language="EN"), "DDLS", "ZR", "ZPKG", "desc")
+    assert out.startswith("OK: created DDLS ZR")
+    assert "sap-language=EN" in seen["url"]
+    assert 'adtcore:masterLanguage="EN"' in seen["body"]
 
 
 # --- CSRF token caching + refetch (fix 1) ---

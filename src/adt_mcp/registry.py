@@ -17,6 +17,7 @@ class System:
     cookie_string: str | None
     allow_write: bool = False
     write_packages: list[str] | None = None
+    write_objects: list[str] | None = None
 
     @classmethod
     def from_dict(cls, name: str, d: dict) -> "System":
@@ -32,6 +33,7 @@ class System:
             cookie_string=d.get("cookie_string"),
             allow_write=d.get("allow_write", False),
             write_packages=d.get("write_packages"),
+            write_objects=d.get("write_objects"),
         )
 
     def to_dict(self) -> dict:

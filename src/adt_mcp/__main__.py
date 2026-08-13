@@ -5,6 +5,7 @@ import os
 import httpx
 from uvicorn.config import LOGGING_CONFIG
 
+from .paths import systems_path
 from .registry import SystemRegistry
 from .adt_client import ADTClient
 from .server import build_server
@@ -36,12 +37,9 @@ def configure_logging() -> None:
 
 def main() -> None:
     configure_logging()
-    base = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-    systems_path = os.environ.get(
-        "ADT_MCP_SYSTEMS", os.path.join(base, "systems.json"))
     port = int(os.environ.get("ADT_MCP_PORT", "8765"))
 
-    registry = SystemRegistry(systems_path)
+    registry = SystemRegistry(systems_path())
     adt = ADTClient(httpx.Client(timeout=30.0, verify=True))
     mcp = build_server(registry, adt)
     mcp.settings.port = port
