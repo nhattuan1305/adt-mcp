@@ -4,16 +4,10 @@ import anyio
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse, HTMLResponse, PlainTextResponse
+from .paths import cookies_dir as _cookies_dir, web_dir as _web_dir
 from .registry import System, SystemRegistry
 from .adt_client import ADTClient
 from .cookie_refresh import refresh_cookies, interactive_login, cdp_capture
-
-
-def _cookies_dir() -> str:
-    d = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "cookies")
-    os.makedirs(d, exist_ok=True)
-    return d
 
 
 def format_systems(systems: list[System]) -> str:
@@ -484,12 +478,9 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
         # Offload to a worker thread like the web-admin routes do.
         return await anyio.to_thread.run_sync(resolve_and_refresh, registry, system)
 
-    web_dir = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "web")
-
     @mcp.custom_route("/", methods=["GET"])
     async def index(request: Request) -> HTMLResponse:
-        path = os.path.join(web_dir, "index.html")
+        path = os.path.join(_web_dir(), "index.html")
         if not os.path.exists(path):
             return PlainTextResponse("web/index.html missing", status_code=500)
         with open(path, encoding="utf-8") as f:
